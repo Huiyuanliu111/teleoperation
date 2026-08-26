@@ -40,7 +40,7 @@ int main(int argc, char **argv)
   }
 
   // ***************** poco *******************
-  bool vis = true && (leadorfollow == "f");
+  bool vis = false;
   std::string m_msg;
   nlohmann::json m_json;
   Poco::Net::SocketAddress sa("localhost", 6666);
@@ -65,7 +65,12 @@ int main(int argc, char **argv)
   // ***************** poco *******************
 
   // =================== data directory per trial ===================
-  fs::path base_dir = "/home/panda/vla_finetune/data";
+  // Store recordings alongside the project instead of relying on a specific
+  // deployment user or a hard-coded /home path. The executable lives in the
+  // project's build directory, so its parent directory is the project root.
+  fs::path project_dir =
+      fs::canonical("/proc/self/exe").parent_path().parent_path();
+  fs::path base_dir = project_dir / "data";
   fs::path trial_dir = base_dir / session_id / format_trial_dir(trial_idx);
 
   if (leadorfollow == "f")
@@ -98,6 +103,8 @@ int main(int argc, char **argv)
 
   bool TDPA_active = parameter["TDPA_active"];
   bool tau_ext_feedback = parameter["tau_ext_feedback"];
+  bool record_data = parameter.value("record_data", false);
+  bool record_camera = parameter.value("record_camera", false);
 
   double gain_tau_ld;
   double gain_dq_l;
@@ -166,7 +173,7 @@ int main(int argc, char **argv)
   std::mutex record_mutex;
   std::unique_ptr<Recorder> rec;
 
-  if (leadorfollow == "f")
+  if (leadorfollow == "f" && record_data)
   {
     std::string data_name = (trial_dir / "DATA_follower").string();
     rec = std::make_unique<Recorder>(t_rec, SampletimeInit, NoDataRec, data_name);
@@ -216,7 +223,11 @@ int main(int argc, char **argv)
   try
   {
     // Connect to robot.
-    franka::Robot robot(robot_ip);
+    // XanMod PREEMPT_RT kernels may not expose /sys/kernel/realtime, which
+    // causes libfranka to reject them even when FIFO real-time scheduling is
+    // available. Real-time capability and user permissions must be verified
+    // on the controller PC before using kIgnore.
+    franka::Robot robot(robot_ip, franka::RealtimeConfig::kIgnore);
     try
     {
       setDefaultBehavior(robot);
@@ -253,26 +264,44 @@ int main(int argc, char **argv)
     // std::cin.ignore();
 
     bool follower_initially_grasped = false;
+    std::cout << "[Gripper Init] Connecting to gripper at " << robot_ip << "..." << std::endl;
     gripper_ptr = std::make_unique<franka::Gripper>(robot_ip);
-    gripper_ptr->homing();
+    std::cout << "[Gripper Init] Connected. Starting homing..." << std::endl;
+    try
+    {
+      if (!gripper_ptr->homing())
+      {
+        throw std::runtime_error("homing returned false");
+      }
+    }
+    catch (const std::exception &ex)
+    {
+      throw std::runtime_error(std::string("[Gripper Init] Homing failed: ") + ex.what());
+    }
+    std::cout << "[Gripper Init] Homing succeeded." << std::endl;
     if (leadorfollow == "l")
     {
       // The closed leader width is the follower's hold command.
-      gripper_ptr->move(0.0, 0.05);  // task: pump bottle, insert plug
+      std::cout << "[Leader Gripper] Closing to 0.0 m..." << std::endl;
+      try
+      {
+        if (!gripper_ptr->move(0.0, 0.05))
+        {
+          throw std::runtime_error("move returned false");
+        }
+      }
+      catch (const std::exception &ex)
+      {
+        throw std::runtime_error(std::string("[Leader Gripper] Initial close failed: ") + ex.what());
+      }
+      std::cout << "[Leader Gripper] Initial close succeeded." << std::endl;
     }
     else
     {
-      const double max_width = gripper_ptr->readOnce().max_width;
-      follower_initially_grasped =
-          gripper_ptr->grasp(0.0, 0.05, 50.0, 0.0, max_width);
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
       const franka::GripperState grasp_state = gripper_ptr->readOnce();
-      if (!follower_initially_grasped || !grasp_state.is_grasped)
-      {
-        throw std::runtime_error("Follower failed to grasp the initial object.");
-      }
-      std::cout << "[Follower Gripper] Initial object grasped at width "
-                << grasp_state.width << " m." << std::endl;
+      follower_initially_grasped = false;
+      std::cout << "[Follower Gripper] Homed. Current width "
+                << grasp_state.width << " m; initial grasp skipped." << std::endl;
     }
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
@@ -351,7 +380,7 @@ int main(int argc, char **argv)
     //////////////////////////////////////////////////////////////////////////////////////////
 
     //*********** camera thread - follower ***********************************************************
-    if (leadorfollow == "f")
+    if (leadorfollow == "f" && record_camera)
     {
       t_camera = std::thread(multi_camera_thread_func, std::ref(g_multi_cam), std::ref(running), trial_dir.string());
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -359,7 +388,7 @@ int main(int argc, char **argv)
     //************************************************************************************************
 
     // ===start recording====================================================================
-    g_record_active.store(true);
+    g_record_active.store(record_data || record_camera);
     //=======================================================================================
 
     ////////////////////// Define callback for the joint torque control
@@ -783,7 +812,7 @@ int main(int argc, char **argv)
         return franka::MotionFinished(zerotorque);
       }
 
-      return tau_d_calculated;
+      return tau_d_rate_limited;
     };
 
     robot.control(impedance_control_callback);
@@ -864,6 +893,7 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, f
     bool ever_grasped = initially_grasped;
     bool gripper_control_armed = !initially_grasped;
     int closed_sample_count = 0;
+    int leader_width_print_count = 0;
     constexpr double arm_width_threshold = 0.01;
     constexpr int required_closed_samples = 5;
 
@@ -872,7 +902,10 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, f
       if (leadorfollow == "l")
       {
         double gripper_width = gripper.readOnce().width;
-        std::cout << "Gripper width is:" << gripper_width << std::endl;
+        if (leader_width_print_count++ % 100 == 0)
+        {
+          std::cout << "Gripper width is:" << gripper_width << std::endl;
+        }
         {
           std::lock_guard<std::mutex> lock(Data2Send.mutex);
           Data2Send.gripper_width = gripper_width;
@@ -1023,8 +1056,8 @@ void multi_camera_thread_func(MultiCamSharedData &shared, bool &running, const s
   std::cout << "---------------[MultiCamThread] started!-----------\n"
             << std::endl;
 
-  RealSenseCam1 cam1(640, 480, 30, "233622072733");
-  RealSenseCam1 cam2(640, 480, 30, "213322073390");
+  RealSenseCam1 cam1(640, 480, 30, "233722072293");
+  RealSenseCam1 cam2(640, 480, 30, "233622071984");
 
   int frame_id1 = 0;
   int frame_id2 = 0;
@@ -1187,10 +1220,26 @@ void udpwithremote_recv(recv_data &Data2Recv, bool &running)
   const int NoDatatoRecv = 32; // add stop_code and gripper_width, 32-- add teleop 0/1 addtorec
 
   double msg2recv[NoDatatoRecv];
+  uint64_t recv_count = 0;
+  bool first_packet_logged = false;
 
   while (running)
   {
-    recvfrom(sockfd, msg2recv, sizeof(msg2recv), MSG_WAITALL, (struct sockaddr *)&cliaddr, &len);
+    len = sizeof(cliaddr);
+    ssize_t n_recv = recvfrom(sockfd, msg2recv, sizeof(msg2recv), MSG_WAITALL,
+                              (struct sockaddr *)&cliaddr, &len);
+    if (n_recv < 0)
+    {
+      perror("recvfrom failed");
+      continue;
+    }
+    if (static_cast<size_t>(n_recv) != sizeof(msg2recv))
+    {
+      std::cerr << "[UDP recv] unexpected packet size: " << n_recv
+                << " bytes, expected " << sizeof(msg2recv) << " bytes"
+                << std::endl;
+      continue;
+    }
 
     if (Data2Recv.mutex.try_lock())
     {
@@ -1238,6 +1287,27 @@ void udpwithremote_recv(recv_data &Data2Recv, bool &running)
       Data2Recv.gripper_width = msg2recv[30];
       Data2Recv.teleop_active = msg2recv[31];
       Data2Recv.has_received.store(true);
+
+      recv_count++;
+      if (!first_packet_logged || recv_count % 1000 == 0)
+      {
+        first_packet_logged = true;
+        double q_delta_norm = 0.0;
+        double dq_norm = 0.0;
+        for (int i = 0; i < 7; i++)
+        {
+          q_delta_norm += Data2Recv.q_remote_delta[i] * Data2Recv.q_remote_delta[i];
+          dq_norm += Data2Recv.dq_remote[i] * Data2Recv.dq_remote[i];
+        }
+        std::cout << "[UDP recv] packets=" << recv_count
+                  << " from=" << inet_ntoa(cliaddr.sin_addr)
+                  << " q_delta_norm=" << std::sqrt(q_delta_norm)
+                  << " dq_norm=" << std::sqrt(dq_norm)
+                  << " grip=" << Data2Recv.gripper_width
+                  << " teleop_active=" << Data2Recv.teleop_active
+                  << " stop=" << Data2Recv.stop_code
+                  << std::endl;
+      }
 
       Data2Recv.mutex.unlock();
     }

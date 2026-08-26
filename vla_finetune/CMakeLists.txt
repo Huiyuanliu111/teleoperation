@@ -14,10 +14,7 @@ find_package(Poco REQUIRED COMPONENTS Net)
 #find_package(realsense2 REQUIRED)
 find_package(OpenCV REQUIRED)
 
-include(FetchContent)
-
-FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.2/json.tar.xz)
-FetchContent_MakeAvailable(json)
+find_package(nlohmann_json REQUIRED)
 
 ### Franka Dynamics Library
 add_library(Dynamics STATIC)
