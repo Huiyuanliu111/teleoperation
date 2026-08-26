@@ -1,0 +1,14 @@
+{
+
+  "robot_ip": "192.168.3.100",
+
+  "local_port": 9999,
+  "remote_ip": "10.157.174.196",
+  "remote_port": 8888,
+  "run_time": 60,
+  "print_rate": 1,
+  "sample_time_init": 0.001,
+  "no_data_record": 84,
+  "b_double": [40, 40, 30, 20, 10, 8, 4],
+  "i_double": [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+}

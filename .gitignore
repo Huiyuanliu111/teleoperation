@@ -1,0 +1,12 @@
+# OS and editor metadata
+.DS_Store
+.idea/
+.vscode/
+.history/
+
+# Local Codex workspace metadata
+.codex/
+.codex
+
+# Logs
+*.log
