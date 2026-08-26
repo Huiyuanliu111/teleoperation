@@ -11,6 +11,10 @@ Example:
     python convert_vla_to_lerobot_v3.py \
         vla_finetune/data/Threading_20260826_120000 \
         data/threading_vla_lerobot_v3
+
+Default camera mapping is ``cam1.mp4`` = side view and ``cam2.mp4`` = wrist.
+Use repeated ``--camera RAW_FILE=FEATURE`` arguments if a deployment uses the
+opposite numbering.
 """
 from __future__ import annotations
 
@@ -26,8 +30,8 @@ import numpy as np
 ROBOT_COLUMNS = 29
 STATE_NAMES = [f"q{i}" for i in range(1, 8)] + ["gripper_width"]
 DEFAULT_CAMERAS = (
-    ("cam1.mp4", "observation.images.exterior_image_1_left"),
-    ("cam2.mp4", "observation.images.exterior_image_2_right"),
+    ("cam1.mp4", "observation.images.exterior_image_2_right"),
+    ("cam2.mp4", "observation.images.wrist_image_left"),
 )
 
 
@@ -258,7 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         type=parse_camera,
         metavar="RAW_FILE=FEATURE",
-        help="repeat for each camera; defaults to cam1.mp4 and cam2.mp4",
+        help="repeat for each camera; defaults to cam1=sideview and cam2=wrist",
     )
     parser.add_argument(
         "--keep-inactive",
