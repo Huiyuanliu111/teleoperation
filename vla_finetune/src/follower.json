@@ -2,9 +2,9 @@
 
   "robot_ip": "192.168.3.100",
 
-  "local_port": 9999,
-  "remote_ip": "10.157.174.196",
-  "remote_port": 8888,
+  "local_port": 5001,
+  "remote_ip": "10.157.175.16",
+  "remote_port": 5001,
   "run_time": 60,
   "print_rate": 1,
   "sample_time_init": 0.001,
