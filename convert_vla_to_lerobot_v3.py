@@ -153,10 +153,12 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
     try:
         for trial in trials:
             matrix = read_follower_matrix(trial / "DATA_follower.m")
-            if args.keep_inactive:
-                active_start, active_stop = 0, len(matrix)
-            else:
+            total_robot_rows = len(matrix)
+            teleop_active_rows = int(np.count_nonzero(matrix[:, 0] > 0.5))
+            if args.active_only:
                 active_start, active_stop = longest_active_span(matrix)
+            else:
+                active_start, active_stop = 0, len(matrix)
             matrix = matrix[active_start:active_stop]
             states = np.concatenate((matrix[:, 1:8], matrix[:, 8:9]), axis=1).astype(
                 np.float32
@@ -215,7 +217,10 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
 
             report = {
                 "trial": str(trial.relative_to(raw_root)),
-                "raw_robot_rows": int(active_stop - active_start),
+                "raw_robot_rows": total_robot_rows,
+                "teleop_active_rows": teleop_active_rows,
+                "selected_robot_rows": int(active_stop - active_start),
+                "kept_inactive_rows": not args.active_only,
                 "active_row_span": [active_start, active_stop],
                 "source_video_frames": dict(
                     zip((feature for _, feature in camera_specs), counts, strict=True)
@@ -265,9 +270,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="repeat for each camera; defaults to cam1=sideview and cam2=wrist",
     )
     parser.add_argument(
-        "--keep-inactive",
+        "--active-only",
         action="store_true",
-        help="keep all robot rows instead of the longest teleoperation-active span",
+        help="keep only the longest teleoperation-active span; all rows are kept by default",
     )
     return parser
 

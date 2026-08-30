@@ -4,10 +4,10 @@
 
 namespace fs = std::filesystem;
 
-static inline std::string format_trial_dir(int trial_idx)
+static inline std::string format_episode_dir(int episode_idx)
 {
   char buf[32];
-  std::snprintf(buf, sizeof(buf), "trial_%03d", trial_idx);
+  std::snprintf(buf, sizeof(buf), "episode_%03d", episode_idx);
   return std::string(buf);
 }
 
@@ -23,13 +23,13 @@ int main(int argc, char **argv)
   {
     std::cerr << "Usage: " << argv[0] << " <robot-hostname>"
               << " "
-              << "<l or f> <session_id> <trial_idx>\n"
+              << "<l or f> <trial_name> <episode_idx>\n"
               << std::endl;
     return -1;
   }
   std::string robot_ip = argv[1];
-  std::string session_id = argv[3];
-  int trial_idx = std::stoi(argv[4]);
+  std::string trial_name = argv[3];
+  int episode_idx = std::stoi(argv[4]);
 
   std::string leadorfollow = argv[2];
 
@@ -71,7 +71,7 @@ int main(int argc, char **argv)
   fs::path project_dir =
       fs::canonical("/proc/self/exe").parent_path().parent_path();
   fs::path base_dir = project_dir / "data";
-  fs::path trial_dir = base_dir / session_id / format_trial_dir(trial_idx);
+  fs::path trial_dir = base_dir / trial_name / format_episode_dir(episode_idx);
 
   if (leadorfollow == "f")
   {
@@ -216,6 +216,7 @@ int main(int argc, char **argv)
   std::thread t_recv;
   std::thread t_camera;
   std::thread t_gripper;
+  int exit_code = 0;
   t_send = std::thread(udpwithremote_send, std::ref(Data2Send), std::ref(running));
   t_recv = std::thread(udpwithremote_recv, std::ref(Data2Recv), std::ref(running));
   // t_gripper = std::thread (gripperControl, std::ref(Data2Send), std::ref(Data2Recv), std::ref(running), robot_ip, leadorfollow, std::ref(gripper_mutex));
@@ -821,6 +822,7 @@ int main(int argc, char **argv)
   {
 
     std::cerr << "[TelePanda] control stopped: " << ex.what() << std::endl;
+    exit_code = 1;
     g_record_active.store(false);
 
     if (leadorfollow == "f")
@@ -873,7 +875,7 @@ int main(int argc, char **argv)
   {
     t_camera.join();
   }
-  return 0;
+  return exit_code;
 }
 
 // void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, const std::string &robot_ip,
