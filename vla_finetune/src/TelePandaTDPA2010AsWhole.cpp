@@ -16,6 +16,13 @@ std::atomic<bool> g_record_active{false};
 std::atomic<bool> g_stop_requested{false};
 std::atomic<double> g_follower_gripper_width{0.0};
 
+static inline int64_t steady_time_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 int main(int argc, char **argv)
 {
 
@@ -105,6 +112,12 @@ int main(int argc, char **argv)
   bool tau_ext_feedback = parameter["tau_ext_feedback"];
   bool record_data = parameter.value("record_data", false);
   bool record_camera = parameter.value("record_camera", false);
+  double gripper_grasp_force = parameter.value("gripper_grasp_force", 50.0);
+  if (gripper_grasp_force <= 0.0 || gripper_grasp_force > 70.0)
+  {
+    std::cerr << "gripper_grasp_force must be in the range (0, 70] N" << std::endl;
+    return -1;
+  }
 
   double gain_tau_ld;
   double gain_dq_l;
@@ -188,7 +201,6 @@ int main(int argc, char **argv)
   std::array<double, 7> q_local_delta{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> dq_local = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> q_remote_delta = {{0, 0, 0, 0, 0, 0, 0}};
-  std::array<double, 7> q_remote_delta_intgl = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> dq_remote = {0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> tau_ext = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> tau_remote = {{0, 0, 0, 0, 0, 0, 0}};
@@ -205,7 +217,6 @@ int main(int argc, char **argv)
   // udpwithremote thread;
   send_data Data2Send;
   recv_data Data2Recv;
-  std::mutex gripper_mutex;
   std::unique_ptr<franka::Gripper> gripper_ptr;
 
   Data2Send.stop_code = 0.0;
@@ -217,9 +228,12 @@ int main(int argc, char **argv)
   std::thread t_camera;
   std::thread t_gripper;
   int exit_code = 0;
+  bool control_diagnostics_valid = false;
+  std::array<double, 7> last_q_measured = {{0, 0, 0, 0, 0, 0, 0}};
+  std::array<double, 7> last_q_desired = {{0, 0, 0, 0, 0, 0, 0}};
+  std::array<double, 7> last_q_remote_delta = {{0, 0, 0, 0, 0, 0, 0}};
   t_send = std::thread(udpwithremote_send, std::ref(Data2Send), std::ref(running));
   t_recv = std::thread(udpwithremote_recv, std::ref(Data2Recv), std::ref(running));
-  // t_gripper = std::thread (gripperControl, std::ref(Data2Send), std::ref(Data2Recv), std::ref(running), robot_ip, leadorfollow, std::ref(gripper_mutex));
 
   try
   {
@@ -282,20 +296,9 @@ int main(int argc, char **argv)
     std::cout << "[Gripper Init] Homing succeeded." << std::endl;
     if (leadorfollow == "l")
     {
-      // The closed leader width is the follower's hold command.
-      std::cout << "[Leader Gripper] Closing to 0.0 m..." << std::endl;
-      try
-      {
-        if (!gripper_ptr->move(0.0, 0.05))
-        {
-          throw std::runtime_error("move returned false");
-        }
-      }
-      catch (const std::exception &ex)
-      {
-        throw std::runtime_error(std::string("[Leader Gripper] Initial close failed: ") + ex.what());
-      }
-      std::cout << "[Leader Gripper] Initial close succeeded." << std::endl;
+      const franka::GripperState leader_gripper_state = gripper_ptr->readOnce();
+      std::cout << "[Leader Gripper] Homed and left open at width "
+                << leader_gripper_state.width << " m." << std::endl;
     }
     else
     {
@@ -311,7 +314,7 @@ int main(int argc, char **argv)
 
     t_gripper = std::thread(gripperControl, std::ref(Data2Send), std::ref(Data2Recv),
                             std::ref(running), std::ref(*gripper_ptr), leadorfollow,
-                            std::ref(gripper_mutex), follower_initially_grasped);
+                            follower_initially_grasped, gripper_grasp_force);
 
     // Load the kinematics and dynamics model.
     franka::Model model = robot.loadModel();
@@ -336,6 +339,7 @@ int main(int argc, char **argv)
       Xb[index] = parameter["Xb"][index];
     }
     Dynamics dyn(M_PI, 0.0, Xb); // Robot dynamics
+    const Eigen::Matrix<double, 7, 7> friction = dyn.get_Fv();
 
     //////////////////////////////////////////////////////////////////////////////////////////
     ///////////         TDPA stuff begin         ///////////////////////////
@@ -365,7 +369,7 @@ int main(int argc, char **argv)
     // Tracking controller parameters
     std::array<double, 7> k_gains = {{0, 0, 0, 0, 0, 0, 0}};
     std::array<double, 7> d_gains = {{0, 0, 0, 0, 0, 0, 0}};
-    Eigen::MatrixXd damping = Eigen::MatrixXd::Zero(7, 7);
+    Eigen::Matrix<double, 7, 7> damping = Eigen::Matrix<double, 7, 7>::Zero();
 
     for (int index = 0; index < parameter["k_gains"].size(); ++index)
     {
@@ -403,6 +407,21 @@ int main(int argc, char **argv)
       // Read current coriolis terms from model.
       // std::cerr << "1111" << std::endl;
       pandatime += period.toSec();
+
+      // Once UDP communication has started, stop rather than reusing stale
+      // motion commands. Starting the follower before the leader is allowed:
+      // the watchdog is armed only after the first packet arrives.
+      if (Data2Recv.has_received.load(std::memory_order_acquire) &&
+          !g_stop_requested.load(std::memory_order_acquire))
+      {
+        constexpr int64_t udp_watchdog_timeout_ns = 100'000'000; // 100 ms
+        const int64_t packet_age_ns =
+            steady_time_ns() - Data2Recv.last_receive_time_ns.load(std::memory_order_acquire);
+        if (packet_age_ns > udp_watchdog_timeout_ns)
+        {
+          throw std::runtime_error("UDP watchdog timeout: no packet received for more than 100 ms");
+        }
+      }
 
       static double teleop_active_recv = 0.0;
       // static int leader_stop_ack_count = 0;
@@ -450,8 +469,6 @@ int main(int argc, char **argv)
       }
 
       // ************************* POCO *************************
-
-      Eigen::MatrixXd friction = dyn.get_Fv();
 
       for (size_t i = 0; i < 7; i++)
       {
@@ -613,10 +630,17 @@ int main(int argc, char **argv)
 
         for (size_t i = 0; i < 7; i++)
         {
-          q_remote_delta_intgl[i] = q_remote_delta_intgl[i] + period.toSec() * dq_des_double[i];
-          q_des[i] = initial_state.q[i] + q_remote_delta_intgl[i];
-          position_error[i] = q_remote_delta_intgl[i] - q_remote_delta[i];
+          // Track the leader's measured position delta directly. Integrating
+          // remote velocity here allowed noise, packet loss, and stale values
+          // to accumulate into an unbounded follower position target.
+          q_des[i] = initial_state.q[i] + q_remote_delta[i];
+          position_error[i] = q_local_delta[i] - q_remote_delta[i];
         }
+
+        last_q_measured = state.q;
+        last_q_desired = q_des;
+        last_q_remote_delta = q_remote_delta;
+        control_diagnostics_valid = true;
 
         for (size_t i = 0; i < 7; i++)
         {
@@ -667,61 +691,66 @@ int main(int argc, char **argv)
       std::array<double, 7> tau_d_rate_limited =
           franka::limitRate(franka::kMaxTorqueRate, tau_d_calculated, state.tau_J_d);
 
+      bool send_data_updated = false;
       {
-        std::lock_guard<std::mutex> lck_send(Data2Send.mutex);
-
-        if (leadorfollow == "l")
+        // Never wait for the non-real-time UDP sender from inside the 1 kHz
+        // robot callback. If the sender is copying a packet, skip this cycle
+        // and publish the newest state on the next available cycle.
+        std::unique_lock<std::mutex> lck_send(Data2Send.mutex, std::try_to_lock);
+        if (lck_send.owns_lock())
         {
-          Data2Send.pandatime = pandatime;
-          Data2Send.q_local_delta = q_local_delta;
-          Data2Send.dq_local = dq_local;
-          Data2Send.teleop_active = teleop_active;
-          if (tau_ext_feedback)
-            Data2Send.tau_local = tau_ext;
-          else
-            Data2Send.tau_local = tau_c;
-          Data2Send.f_local = f_local;
-          Data2Send.energy = E_L_in;
 
-          if (Data2Recv.stop_code == 1.0)
+          if (leadorfollow == "l")
           {
-            Data2Send.stop_code = 2.0;
-            leader_stop_ack_count++;
+            Data2Send.pandatime = pandatime;
+            Data2Send.q_local_delta = q_local_delta;
+            Data2Send.dq_local = dq_local;
+            Data2Send.teleop_active = teleop_active;
+            if (tau_ext_feedback)
+              Data2Send.tau_local = tau_ext;
+            else
+              Data2Send.tau_local = tau_c;
+            Data2Send.f_local = f_local;
+            Data2Send.energy = E_L_in;
+
+            if (Data2Recv.stop_code == 1.0)
+            {
+              Data2Send.stop_code = 2.0;
+              leader_stop_ack_count++;
+            }
+            else if (leader_stop_ack_count == 0)
+            {
+              Data2Send.stop_code = 0.0;
+            }
           }
-          else if (leader_stop_ack_count == 0)
-          {
-            Data2Send.stop_code = 0.0;
-          }
-        }
-        else
-        {
-          Data2Send.pandatime = pandatime;
-          Data2Send.q_local_delta = q_local_delta;
-          Data2Send.dq_local = dq_local;
-          if (tau_ext_feedback)
-            Data2Send.tau_local = tau_ext;
           else
           {
-            Data2Send.tau_local[0] = tau_c[0];
-            Data2Send.tau_local[1] = tau_c[1];
-            Data2Send.tau_local[2] = tau_c[2];
-            Data2Send.tau_local[3] = tau_c[3];
-            Data2Send.tau_local[4] = tau_c[4];
-            Data2Send.tau_local[5] = tau_c[5];
-            Data2Send.tau_local[6] = tau_c[6];
+            Data2Send.pandatime = pandatime;
+            Data2Send.q_local_delta = q_local_delta;
+            Data2Send.dq_local = dq_local;
+            if (tau_ext_feedback)
+              Data2Send.tau_local = tau_ext;
+            else
+            {
+              Data2Send.tau_local[0] = tau_c[0];
+              Data2Send.tau_local[1] = tau_c[1];
+              Data2Send.tau_local[2] = tau_c[2];
+              Data2Send.tau_local[3] = tau_c[3];
+              Data2Send.tau_local[4] = tau_c[4];
+              Data2Send.tau_local[5] = tau_c[5];
+              Data2Send.tau_local[6] = tau_c[6];
+            }
+            Data2Send.f_local = f_local;
+            Data2Send.energy = E_F_in;
           }
-          Data2Send.f_local = f_local;
-          Data2Send.energy = E_F_in;
-        }
 
-        send_allowed = true;
+          send_allowed = true;
+          send_data_updated = true;
+        }
       }
-      cv_send.notify_one();
-
-      double gripper_width;
+      if (send_data_updated)
       {
-        std::lock_guard<std::mutex> lock(gripper_mutex);
-        gripper_width = Data2Recv.gripper_width;
+        cv_send.notify_one();
       }
 
       // Logging Data
@@ -759,7 +788,6 @@ int main(int argc, char **argv)
           rec->addToRec(state.K_F_ext_hat_K);
           // rec->addToRec(q_local_delta); // q_local_delta
           // rec->addToRec(q_remote_delta);
-          // rec->addToRec(q_remote_delta_intgl.data(), 7);
           // rec->addToRec(dq_local);
           // rec->addToRec(dq_remote);
           rec->addToRec(leader_q); // leader joint trajectory
@@ -822,6 +850,12 @@ int main(int argc, char **argv)
   {
 
     std::cerr << "[TelePanda] control stopped: " << ex.what() << std::endl;
+    if (control_diagnostics_valid)
+    {
+      std::cerr << "[TelePanda] last q measured      = " << last_q_measured << std::endl;
+      std::cerr << "[TelePanda] last q desired       = " << last_q_desired << std::endl;
+      std::cerr << "[TelePanda] last leader q delta  = " << last_q_remote_delta << std::endl;
+    }
     exit_code = 1;
     g_record_active.store(false);
 
@@ -843,10 +877,15 @@ int main(int argc, char **argv)
         servaddr.sin_port = htons(PORTSend);
         servaddr.sin_addr.s_addr = inet_addr(IP_remote);
 
-        const int NoDatatosend = 30;
+        // Keep emergency stop packets compatible with the normal 32-double
+        // UDP protocol. A legacy 30-double packet is rejected by the peer and
+        // would make the peer report a watchdog timeout instead of stopping.
+        const int NoDatatosend = 32;
         double msg2send[NoDatatosend] = {0};
 
         msg2send[29] = 1.0;
+        msg2send[30] = g_follower_gripper_width.load();
+        msg2send[31] = 0.0;
 
         for (int k = 0; k < 20; k++)
         {
@@ -878,11 +917,9 @@ int main(int argc, char **argv)
   return exit_code;
 }
 
-// void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, const std::string &robot_ip,
-// const std::string &leadorfollow, std::mutex &gripper_mutex)
 void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, franka::Gripper &gripper,
-                    const std::string &leadorfollow, std::mutex &gripper_mutex,
-                    bool initially_grasped)
+                    const std::string &leadorfollow, bool initially_grasped,
+                    double grasp_force)
 {
 
   try
@@ -893,11 +930,21 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, f
 
     bool grasp_flag = initially_grasped;
     bool ever_grasped = initially_grasped;
-    bool gripper_control_armed = !initially_grasped;
-    int closed_sample_count = 0;
+    enum class LeaderGripperPhase
+    {
+      kWaitForOpen,
+      kWaitForClose,
+      kCloseConsumed
+    };
+    LeaderGripperPhase leader_gripper_phase = initially_grasped
+                                                   ? LeaderGripperPhase::kCloseConsumed
+                                                   : LeaderGripperPhase::kWaitForOpen;
+    int open_sample_count = 0;
+    int close_sample_count = 0;
     int leader_width_print_count = 0;
-    constexpr double arm_width_threshold = 0.01;
-    constexpr int required_closed_samples = 5;
+    constexpr double close_threshold = 0.005;
+    constexpr double open_threshold = 0.02;
+    constexpr int required_state_samples = 5;
 
     while (running)
     {
@@ -908,15 +955,15 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, f
         {
           std::cout << "Gripper width is:" << gripper_width << std::endl;
         }
-        {
-          std::lock_guard<std::mutex> lock(Data2Send.mutex);
-          Data2Send.gripper_width = gripper_width;
+        // Gripper width is independent from the 1 kHz robot-state packet
+        // mutex. This prevents the gripper thread from being delayed or
+        // starved by the real-time callback and UDP sender.
+        Data2Send.gripper_width.store(gripper_width, std::memory_order_release);
 
-          if (Data2Recv.stop_code > 0.5)
-          {
-            std::cout << "[Leader Gripper] Stop!" << std::endl;
-            break;
-          }
+        if (g_stop_requested.load(std::memory_order_acquire))
+        {
+          std::cout << "[Leader Gripper] Stop!" << std::endl;
+          break;
         }
       }
       else
@@ -932,30 +979,80 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, f
         double current_width = gripper.readOnce().width;
         g_follower_gripper_width.store(current_width);
 
-        // Keep the initial grasp active through leader startup. Only enable
-        // release commands after several genuine closed-width samples.
-        if (!gripper_control_armed)
+        // Before the first successful grasp, accept only a genuine
+        // open-to-close transition from the leader. This prevents the
+        // leader's startup state or a stale UDP value from triggering
+        // repeated grasp attempts.
+        if (!ever_grasped && !grasp_flag)
         {
-          if (Data2Recv.has_received.load() && target_width < arm_width_threshold)
+          if (leader_gripper_phase == LeaderGripperPhase::kWaitForOpen)
           {
-            closed_sample_count++;
-            if (closed_sample_count >= required_closed_samples)
+            if (Data2Recv.has_received.load() && target_width >= open_threshold)
             {
-              gripper_control_armed = true;
-              std::cout << "[Follower Gripper] Closed leader confirmed; release control armed."
+              open_sample_count++;
+              if (open_sample_count >= required_state_samples)
+              {
+                leader_gripper_phase = LeaderGripperPhase::kWaitForClose;
+                open_sample_count = 0;
+                std::cout << "[Follower Gripper] Leader open state confirmed; waiting for close."
+                          << std::endl;
+              }
+            }
+            else
+            {
+              open_sample_count = 0;
+            }
+          }
+          else if (leader_gripper_phase == LeaderGripperPhase::kWaitForClose)
+          {
+            if (target_width < close_threshold)
+            {
+              close_sample_count++;
+              if (close_sample_count >= required_state_samples)
+              {
+                leader_gripper_phase = LeaderGripperPhase::kCloseConsumed;
+                close_sample_count = 0;
+                std::cout << "[Follower Gripper] Leader close action confirmed; grasping once."
+                          << std::endl;
+                movetoGrasp(gripper, target_width, grasp_flag, ever_grasped, grasp_force);
+                if (!grasp_flag)
+                {
+                  // A failed grasp command may leave the fingers partly
+                  // closed. Keep the release path armed so that a subsequent
+                  // leader-open command always reopens the follower.
+                  grasp_flag = true;
+                  ever_grasped = true;
+                  std::cerr << "[Follower Gripper] Grasp was not confirmed; release remains armed."
+                            << std::endl;
+                }
+              }
+            }
+            else
+            {
+              close_sample_count = 0;
+            }
+          }
+          else if (target_width >= open_threshold)
+          {
+            open_sample_count++;
+            if (open_sample_count >= required_state_samples)
+            {
+              leader_gripper_phase = LeaderGripperPhase::kWaitForClose;
+              open_sample_count = 0;
+              std::cout << "[Follower Gripper] Leader reopened; next close action armed."
                         << std::endl;
             }
           }
           else
           {
-            closed_sample_count = 0;
+            open_sample_count = 0;
           }
 
           std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(10));
           continue;
         }
 
-        bool done = movetoGrasp(gripper, target_width, grasp_flag, ever_grasped);
+        bool done = movetoGrasp(gripper, target_width, grasp_flag, ever_grasped, grasp_force);
         if (done)
         {
           std::cout << "[Gripper] released, stop gripper thread." << std::endl;
@@ -981,7 +1078,7 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, f
 }
 
 bool movetoGrasp(franka::Gripper &gripper, double target_width,
-                 bool &grasp_flag, bool &ever_grasped)
+                 bool &grasp_flag, bool &ever_grasped, double grasp_force)
 {
 
   const double grasp_threshold = 0.005;
@@ -999,14 +1096,22 @@ bool movetoGrasp(franka::Gripper &gripper, double target_width,
     try
     {
       const double max_width = gripper.readOnce().max_width;
-      if (gripper.grasp(0.0, 0.05, 50.0, 0.0, max_width))
+      if (gripper.grasp(0.0, 0.05, grasp_force, 0.0, max_width))
       {
         grasp_flag = true;
         ever_grasped = true;
+        const double grasped_width = gripper.readOnce().width;
+        std::cout << "[Follower Gripper] Grasp succeeded at width "
+                  << grasped_width << " m with force " << grasp_force << " N."
+                  << std::endl;
       }
       else
       {
-        std::cerr << "[Follower Gripper] Failed to grasp an object." << std::endl;
+        const franka::GripperState failed_grasp_state = gripper.readOnce();
+        std::cerr << "[Follower Gripper] Failed to grasp an object with force "
+                  << grasp_force << " N; width=" << failed_grasp_state.width
+                  << " m, is_grasped=" << failed_grasp_state.is_grasped << "."
+                  << std::endl;
       }
     }
     catch (const franka::Exception &e)
@@ -1157,28 +1262,31 @@ void udpwithremote_send(send_data &Data2send, bool &running)
 
   while (running)
   {
-    std::unique_lock<std::mutex> lck_send(Data2send.mutex);
-    cv_send.wait(lck_send, []
-                 { return send_allowed; });
+    std::array<double, NoDatatoSend> msg2send;
+    {
+      std::unique_lock<std::mutex> lck_send(Data2send.mutex);
+      cv_send.wait(lck_send, []
+                   { return send_allowed; });
 
-    double msg2send[NoDatatoSend] = {
-        Data2send.pandatime, Data2send.q_local_delta[0], Data2send.q_local_delta[1],
-        Data2send.q_local_delta[2], Data2send.q_local_delta[3], Data2send.q_local_delta[4],
-        Data2send.q_local_delta[5], Data2send.q_local_delta[6], Data2send.dq_local[0],
-        Data2send.dq_local[1], Data2send.dq_local[2], Data2send.dq_local[3],
-        Data2send.dq_local[4], Data2send.dq_local[5], Data2send.dq_local[6],
-        Data2send.tau_local[0], Data2send.tau_local[1], Data2send.tau_local[2],
-        Data2send.tau_local[3], Data2send.tau_local[4], Data2send.tau_local[5],
-        Data2send.tau_local[6], Data2send.f_local[0], Data2send.f_local[1],
-        Data2send.f_local[2], Data2send.f_local[3], Data2send.f_local[4],
-        Data2send.f_local[5], Data2send.energy, Data2send.stop_code, Data2send.gripper_width,
-        Data2send.teleop_active};
+      msg2send = {
+          Data2send.pandatime, Data2send.q_local_delta[0], Data2send.q_local_delta[1],
+          Data2send.q_local_delta[2], Data2send.q_local_delta[3], Data2send.q_local_delta[4],
+          Data2send.q_local_delta[5], Data2send.q_local_delta[6], Data2send.dq_local[0],
+          Data2send.dq_local[1], Data2send.dq_local[2], Data2send.dq_local[3],
+          Data2send.dq_local[4], Data2send.dq_local[5], Data2send.dq_local[6],
+          Data2send.tau_local[0], Data2send.tau_local[1], Data2send.tau_local[2],
+          Data2send.tau_local[3], Data2send.tau_local[4], Data2send.tau_local[5],
+          Data2send.tau_local[6], Data2send.f_local[0], Data2send.f_local[1],
+          Data2send.f_local[2], Data2send.f_local[3], Data2send.f_local[4],
+          Data2send.f_local[5], Data2send.energy, Data2send.stop_code,
+          Data2send.gripper_width.load(std::memory_order_acquire),
+          Data2send.teleop_active};
+      send_allowed = false;
+    }
 
-    sendto(sockfd, msg2send, sizeof(msg2send), MSG_CONFIRM, (const struct sockaddr *)&servaddr,
+    // Never hold Data2send.mutex across a potentially blocking system call.
+    sendto(sockfd, msg2send.data(), sizeof(msg2send), MSG_CONFIRM, (const struct sockaddr *)&servaddr,
            sizeof(servaddr));
-
-    send_allowed = false;
-    lck_send.unlock();
   }
 
   close(sockfd);
@@ -1243,8 +1351,8 @@ void udpwithremote_recv(recv_data &Data2Recv, bool &running)
       continue;
     }
 
-    if (Data2Recv.mutex.try_lock())
     {
+      std::lock_guard<std::mutex> recv_lock(Data2Recv.mutex);
       Data2Recv.remotetime = msg2recv[0];
 
       Data2Recv.q_remote_delta[0] = msg2recv[1];
@@ -1288,6 +1396,7 @@ void udpwithremote_recv(recv_data &Data2Recv, bool &running)
 
       Data2Recv.gripper_width = msg2recv[30];
       Data2Recv.teleop_active = msg2recv[31];
+      Data2Recv.last_receive_time_ns.store(steady_time_ns(), std::memory_order_release);
       Data2Recv.has_received.store(true);
 
       recv_count++;
@@ -1310,8 +1419,6 @@ void udpwithremote_recv(recv_data &Data2Recv, bool &running)
                   << " stop=" << Data2Recv.stop_code
                   << std::endl;
       }
-
-      Data2Recv.mutex.unlock();
     }
   }
   close(sockfd);

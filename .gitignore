@@ -7,6 +7,28 @@
 # Local Codex workspace metadata
 .codex/
 .codex
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+CMakeFiles/
+*.o
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Runtime outputs
+outputs/
+*.log
+
 
 # Logs
 *.log

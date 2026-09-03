@@ -3,6 +3,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <functional>
 #include <iostream>
@@ -89,7 +91,7 @@ struct send_data
   std::array<double, 6> f_local = {{0, 0, 0, 0, 0, 0}};
   double energy = 0;
   double stop_code = 0;
-  double gripper_width = 0.08;
+  std::atomic<double> gripper_width{0.08};
   double teleop_active = 0.0;
 };
 
@@ -97,6 +99,7 @@ struct recv_data
 {
   std::mutex mutex;
   std::atomic<bool> has_received{false};
+  std::atomic<int64_t> last_receive_time_ns{0};
   double remotetime = 0;
   std::array<double, 7> q_remote_delta = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> dq_remote = {0, 0, 0, 0, 0, 0, 0};
@@ -134,16 +137,11 @@ void udpwithremote_send(send_data &Data2Send, bool &running);
 void udpwithremote_recv(recv_data &Data2Recv, bool &running);
 
 bool movetoGrasp(franka::Gripper &gripper, double target_width,
-                 bool &grasp_flag, bool &ever_grasped);
+                 bool &grasp_flag, bool &ever_grasped, double grasp_force);
 
 void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, franka::Gripper &gripper,
-                   const std::string &leadorfollow, std::mutex &gripper_mutex,
-                   bool initially_grasped);
-
-// void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, const std::string &robot_ip ,
-//                    const std::string &leadorfollow, std::mutex &gripper_mutex);
-                  
-
+                   const std::string &leadorfollow, bool initially_grasped,
+                   double grasp_force);
 
 //void check_wiggle_info(wiggle_para & w_para, json parameter);
 

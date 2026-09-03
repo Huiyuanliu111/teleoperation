@@ -52,10 +52,13 @@ Follower data and camera recording are enabled for collection:
 
 ```json
 "record_data": true,
-"record_camera": true
+"record_camera": true,
+"gripper_grasp_force": 70.0
 ```
 
-Only the follower writes the recorded files.
+Only the follower writes the recorded files. `gripper_grasp_force` controls the
+follower grasp force in newtons and must be greater than `0` and no more than
+`70`.
 
 ## Controller PC Requirements
 
@@ -225,10 +228,15 @@ Leader:
 
 ```text
 [Gripper Init] Homing succeeded.
-[Leader Gripper] Initial close succeeded.
+[Leader Gripper] Homed and left open at width ... m.
 Finished moving to initial joint configuration.
 TDPA initialize done
 ```
+
+After startup, the follower ignores closed or stale initial values. It first
+confirms that the leader gripper is open, then treats a confirmed open-to-close
+transition as one grasp command. A failed grasp is attempted only once; the
+leader must reopen and close again before another attempt.
 
 Both sides should also print UDP receive diagnostics:
 
@@ -238,6 +246,12 @@ Both sides should also print UDP receive diagnostics:
 
 On the follower, packets should come from `10.157.175.16`. On the leader,
 packets should come from `10.157.175.22`.
+
+After the first UDP packet, a `100 ms` communication watchdog is active. If no
+new packet arrives within that interval, the current episode stops instead of
+continuing with stale motion commands. The follower tracks the leader's joint
+position delta directly. Application-level joint soft limits are not enabled;
+joint-limit protection is provided by libfranka and the robot controller.
 
 ## UDP Debugging
 

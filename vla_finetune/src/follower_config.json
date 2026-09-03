@@ -8,6 +8,7 @@
     "n_data_record": 100,
     "record_data": true,
     "record_camera": true,
+    "gripper_grasp_force": 70.0,
     "TDPA_active": false,
     "tau_ext_feedback": true,
     "k_pos_drift": 0.0,
