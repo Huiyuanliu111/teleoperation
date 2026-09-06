@@ -267,7 +267,10 @@ int main(int argc, char **argv)
 
     // First move the robot to a suitable joint configuration
     // std::array<double, 7> q_goal = {{0, -M_PI_4, 0, -3 * M_PI_4, 0, M_PI_2, M_PI_4}}; //default config
-    std::array<double, 7> q_goal = {{0.0280118, -0.147561, -0.000796957, -2.27704, -0.0130294, 2.0894, 0.789267}}; // initial config for 3 robot experiment
+    // Low collection posture captured from the follower on 2026-09-04. Keep
+    // this aligned with threading_real/scripts/deploy_threading_real.py so
+    // data collection and policy deployment start from the same pose.
+    std::array<double, 7> q_goal = {{0.307272, 0.323924, -0.112529, -2.501686, -0.012559, 2.764401, 0.833281}};
     // std::array<double, 7> q_goal = {{0, M_PI / 6, 0, -2 * M_PI_4, 0, M_PI_2, M_PI_4}};
 
     std::cout << "error recover." << std::endl;

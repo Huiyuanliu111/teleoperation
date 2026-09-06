@@ -244,6 +244,11 @@ Both sides should also print UDP receive diagnostics:
 [UDP recv] packets=... from=... q_delta_norm=... dq_norm=...
 ```
 
+Both robots move to the low collection posture
+`[0.307272, 0.323924, -0.112529, -2.501686, -0.012559, 2.764401, 0.833281]`
+rad before teleoperation starts. This is the same default start posture used by
+the `threading_real` deployment scripts.
+
 On the follower, packets should come from `10.157.175.16`. On the leader,
 packets should come from `10.157.175.22`.
 
