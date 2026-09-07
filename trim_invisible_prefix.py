@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 
 
-CAMERA_FILES = ("cam1.mp4", "cam2.mp4")
+CAMERA_FILES = ("cam1.mp4", "cam2.mp4", "cam3.mp4")
 ROBOT_FILE = "DATA_follower.m"
 MINIMUM_COMPONENT_AREA = 50
 
@@ -34,6 +34,14 @@ def discover_trials(raw_root: Path) -> list[Path]:
     trials = sorted(path.parent for path in raw_root.rglob(ROBOT_FILE))
     if not trials:
         raise FileNotFoundError(f"no {ROBOT_FILE} files found under {raw_root}")
+    timestamped = [
+        trial for trial in trials if (trial / "recording_manifest.json").is_file()
+    ]
+    if timestamped:
+        raise ValueError(
+            "trim_invisible_prefix.py is only safe for legacy RGB recordings; "
+            "timestamped RGB-D episodes must be filtered during conversion"
+        )
     return trials
 
 
@@ -180,8 +188,10 @@ def detect_command(args: argparse.Namespace) -> None:
         relative = trial.relative_to(raw_root)
         cam1 = trial / "cam1.mp4"
         cam2 = trial / "cam2.mp4"
+        cam3 = trial / "cam3.mp4"
         start, scores, cam1_info = detect_start(cam1)
         cam2_info = video_info(cam2)
+        cam3_info = video_info(cam3)
         rows = matlab_row_count(trial / ROBOT_FILE)
         start_row = robot_start_row(start, int(cam1_info["frames"]), rows)
         next_scores = scores[start : start + 10]
@@ -192,6 +202,7 @@ def detect_command(args: argparse.Namespace) -> None:
             "robot_start_row": start_row,
             "cam1": cam1_info,
             "cam2": cam2_info,
+            "cam3": cam3_info,
             "robot_rows": rows,
             "detection_score": scores[start],
             "median_next_10_score": float(np.median(next_scores)),

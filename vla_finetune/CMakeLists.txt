@@ -11,10 +11,16 @@ find_package(Franka REQUIRED HINTS ~/libfranka/build)
 find_package(Eigen3 REQUIRED)
 find_package(Poco REQUIRED COMPONENTS Net)
 # find_package(gram_savitzky_golay REQUIRED)
-#find_package(realsense2 REQUIRED)
+find_package(realsense2 REQUIRED)
 find_package(OpenCV REQUIRED)
 
 find_package(nlohmann_json REQUIRED)
+
+find_path(ZSTD_INCLUDE_DIR zstd.h)
+find_library(ZSTD_LIBRARY NAMES zstd)
+if(NOT ZSTD_INCLUDE_DIR OR NOT ZSTD_LIBRARY)
+  message(FATAL_ERROR "libzstd development files are required for lossless depth recording")
+endif()
 
 ### Franka Dynamics Library
 add_library(Dynamics STATIC)
@@ -74,7 +80,8 @@ foreach(code ${EXAMPLES})
     include
     src 
     ${OpenCV_INCLUDE_DIRS} 
+    ${ZSTD_INCLUDE_DIR}
 
   )
-  target_link_libraries(${code} Franka::Franka examples_common Eigen3::Eigen Threads::Threads nlohmann_json::nlohmann_json Poco::Net Dynamics ${OpenCV_LIBS} realsense2)
+  target_link_libraries(${code} Franka::Franka examples_common Eigen3::Eigen Threads::Threads nlohmann_json::nlohmann_json Poco::Net Dynamics ${OpenCV_LIBS} realsense2 ${ZSTD_LIBRARY})
 endforeach()

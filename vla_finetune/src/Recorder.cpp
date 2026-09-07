@@ -10,6 +10,7 @@
 
 #include <Eigen/Dense>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -192,6 +193,9 @@ void Recorder::addToRec(Vector3d& vector) {
 void Recorder::saveData() {
   std::ofstream myfile;
   myfile.open(_name + ".m");
+  // Preserve the common host clock and joint values. The ostream default of
+  // six significant digits is far too coarse for nanosecond timestamps.
+  myfile << std::setprecision(17);
   //myfile << _name << "m" <<"=[" << _DAT << "];\n";
   myfile << _name << "m" <<"=[" << _DAT.topRows(_rowindex) << "];\n";
   myfile.close();

@@ -8,6 +8,11 @@
     "n_data_record": 100,
     "record_data": true,
     "record_camera": true,
+    "camera_serials": {
+        "cam1": "233722072293",
+        "cam2": "233622071984",
+        "cam3": "233522077069"
+    },
     "gripper_grasp_force": 70.0,
     "TDPA_active": false,
     "tau_ext_feedback": true,

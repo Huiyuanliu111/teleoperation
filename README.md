@@ -53,6 +53,11 @@ Follower data and camera recording are enabled for collection:
 ```json
 "record_data": true,
 "record_camera": true,
+"camera_serials": {
+  "cam1": "233722072293",
+  "cam2": "233622071984",
+  "cam3": "233522077069"
+},
 "gripper_grasp_force": 70.0
 ```
 
@@ -74,6 +79,10 @@ The Franka stack must also be installed on both PCs:
 - `libfranka`
 - Franka CMake package discoverable by CMake
 - Real-time capable kernel or verified real-time scheduling permissions
+
+ROS is not used by this collector and must not be installed just for data
+collection. The build links directly against the follower's existing standalone
+`libfranka`, RealSense SDK, OpenCV, and Poco installations.
 
 Check real-time status:
 
@@ -177,9 +186,50 @@ Recordings use the following directory structure:
 ```text
 vla_finetune/data/<trial_name>/episode_001/
   DATA_follower.m
+  recording_manifest.json
   cam1.mp4
+  cam1_depth.z16.zst
+  cam1_timestamps.csv
+  cam1_metadata.json
   cam2.mp4
+  cam2_depth.z16.zst
+  cam2_timestamps.csv
+  cam2_metadata.json
+  cam3.mp4
+  cam3_depth.z16.zst
+  cam3_timestamps.csv
+  cam3_metadata.json
 ```
+
+The camera mapping is `cam1=sideview`, `cam2=wrist`, and `cam3=frontview`.
+The three serial numbers are configured in `follower_config.json`. Verify the
+mapping physically on the follower before collection; enumeration alone cannot
+tell which viewpoint a camera occupies:
+
+```bash
+cd ~/teleoperation/vla_finetune/build
+./TestRealSense --list
+./TestRealSense --preview <serial>
+```
+
+`--list` is headless and does not require ROS. `--preview` opens RGB and aligned
+depth windows; run it once per serial and assign the observed role in
+`src/follower_config.json`.
+
+Each camera runs in its own capture thread. Depth is aligned to color and each
+640x480 little-endian Z16 frame is compressed independently with lossless Zstd
+level 1. The timestamp CSV stores its byte offset and compressed length, so the
+converter retains random access and ignores a trailing partial write after an
+error. Camera CSVs and the first column of the 30-column follower matrix use the
+same `std::chrono::steady_clock` nanosecond clock. RealSense sensor timestamps
+and frame numbers are retained as additional diagnostics. Legacy uncompressed
+`camN_depth.z16` episodes remain supported.
+
+Raw three-camera depth would be about 55 MB/s. On the two smoke episodes, Zstd
+reduced one representative depth stream from 407 MB to about 61 MB; the exact
+ratio depends on the scene. Record to the follower's local SSD. Do not run
+`trim_invisible_prefix.py` on RGB-D recordings; filter timestamped episodes
+during conversion instead.
 
 For repeated recording, run the loop script on both computers with the same
 trial name and episode count. Start the follower script first, then the leader
@@ -249,6 +299,61 @@ Both robots move to the low collection posture
 rad before teleoperation starts. This is the same default start posture used by
 the `threading_real` deployment scripts.
 
+Before collecting a full dataset, record two or three episodes and validate
+all committed RGB-D frames and timestamp joins. Raw acquisition stays on the
+follower. Run the Python validator on a machine that already has the `pushbox`
+environment (the follower currently does not), either after copying those test
+episodes or through a mounted follower data directory:
+
+```bash
+cd /home/huiyuan/teleoperation
+conda run -n pushbox python validate_vla_rgbd.py \
+  <path-to-follower-data>/<trial_name> \
+  --output data/<trial_name>_rgbd_validation.json
+```
+
+The default limits are 25 ms between cameras and 5 ms between a reference
+camera frame and the nearest robot row. Conversion uses the same limits:
+
+```bash
+conda run -n pushbox python convert_vla_to_lerobot_v3.py \
+  vla_finetune/data/<trial_name> data/<dataset_name> \
+  --repo-id local/<dataset_name> --task "pick up and insert the block" \
+  --image-size 224
+```
+
+For timestamped recordings this creates standard LeRobot RGB videos plus a
+portable `rgbd/episode_XXXXXX/` sidecar containing original-resolution MP4s,
+lossless time-aligned Z16 depth, source-frame indices, and robot/camera host
+timestamps.
+Passing `--skip-depth` is explicit opt-out and is not appropriate for point
+cloud training. Legacy 29-column RGB recordings are still converted with the
+old approximate normalized-progress mapping.
+
+Build the point-cloud training sidecar directly from the new follower recording:
+
+```bash
+conda run -n pushbox python build_vla_pointcloud_dataset.py \
+  vla_finetune/data/<trial_name> \
+  data/<trial_name>_pointcloud_stride5.h5 \
+  --calibration threading_real/calibration/block_grasp_spatial.json \
+  --stride 5 --num-points 8192
+```
+
+This applies the same geometry used by `arp/real-robot`: aligned depth is
+deprojected with the recorded intrinsics, transformed into the Franka base frame,
+cropped to the workspace, and sampled to a fixed point count. The output stores
+base-frame XYZ, RGB, camera provenance, synchronized robot state, and the next
+stride-5 state. The default base-frame crop is
+`[0.15, -0.40, -0.15]` to `[0.75, 0.30, 0.50]` metres and can be changed with
+`--bounds XMIN YMIN ZMIN XMAX YMAX ZMAX` after inspecting a trial.
+
+Only `sideview` and `frontview` are fused because their base extrinsics are
+already calibrated. The wrist RGB-D stream is retained in the raw data, but it
+requires a separate hand-eye calibration before it can be transformed into the
+base frame. This restriction prevents geometrically incorrect three-camera
+fusion while preserving everything needed to add the wrist view later.
+
 On the follower, packets should come from `10.157.175.16`. On the leader,
 packets should come from `10.157.175.22`.
 
@@ -300,6 +405,15 @@ Install OpenCV development files:
 
 ```bash
 sudo apt install libopencv-dev
+```
+
+### `realsense2Config.cmake` or `librealsense2/rs.hpp` not found
+
+The RGB-D recorder requires the RealSense development package, not only the
+runtime tools:
+
+```bash
+sudo apt install librealsense2-dev
 ```
 
 ### `Running kernel does not have realtime capabilities`

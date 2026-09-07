@@ -11,10 +11,20 @@ static inline std::string format_episode_dir(int episode_idx)
   return std::string(buf);
 }
 
-MultiCamSharedData g_multi_cam;
 std::atomic<bool> g_record_active{false};
 std::atomic<bool> g_stop_requested{false};
 std::atomic<double> g_follower_gripper_width{0.0};
+std::atomic<int> g_cameras_ready{0};
+std::atomic<bool> g_camera_capture_failed{false};
+std::array<std::atomic<uint64_t>, 3> g_camera_committed_frames = {
+    std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0},
+    std::atomic<uint64_t>{0}};
+volatile std::sig_atomic_t g_signal_stop_requested = 0;
+
+extern "C" void request_graceful_stop(int)
+{
+  g_signal_stop_requested = 1;
+}
 
 static inline int64_t steady_time_ns()
 {
@@ -25,7 +35,6 @@ static inline int64_t steady_time_ns()
 
 int main(int argc, char **argv)
 {
-
   if (argc != 5)
   {
     std::cerr << "Usage: " << argv[0] << " <robot-hostname>"
@@ -45,6 +54,8 @@ int main(int argc, char **argv)
     std::cerr << "use l or f" << std::endl;
     return -1;
   }
+  std::signal(SIGINT, request_graceful_stop);
+  std::signal(SIGTERM, request_graceful_stop);
 
   // ***************** poco *******************
   bool vis = false;
@@ -112,6 +123,23 @@ int main(int argc, char **argv)
   bool tau_ext_feedback = parameter["tau_ext_feedback"];
   bool record_data = parameter.value("record_data", false);
   bool record_camera = parameter.value("record_camera", false);
+  std::array<std::string, 3> camera_serials = {
+      "233722072293", "233622071984", "233522077069"};
+  if (parameter.contains("camera_serials"))
+  {
+    const auto &configured_serials = parameter.at("camera_serials");
+    camera_serials = {
+        configured_serials.at("cam1").get<std::string>(),
+        configured_serials.at("cam2").get<std::string>(),
+        configured_serials.at("cam3").get<std::string>()};
+  }
+  if (camera_serials[0] == camera_serials[1] ||
+      camera_serials[0] == camera_serials[2] ||
+      camera_serials[1] == camera_serials[2])
+  {
+    std::cerr << "camera_serials must contain three distinct serial numbers" << std::endl;
+    return -1;
+  }
   double gripper_grasp_force = parameter.value("gripper_grasp_force", 50.0);
   if (gripper_grasp_force <= 0.0 || gripper_grasp_force > 70.0)
   {
@@ -175,14 +203,16 @@ int main(int argc, char **argv)
     double beta;
 
   } print_data{};
-  bool running{true};
+  std::atomic<bool> running{true};
 
   // recording data
   int index = 0;
   double t_rec = 30;
   double SampletimeInit = 0.001;
   // const int NoDataRec = 106;
-  const int NoDataRec = 29; // 15 + 14
+  // v2 prepends host_steady_timestamp_ns to the legacy 29 columns. Camera
+  // timestamp CSV files use the same clock for exact nearest-neighbour joins.
+  const int NoDataRec = 30;
   std::mutex record_mutex;
   std::unique_ptr<Recorder> rec;
 
@@ -225,7 +255,7 @@ int main(int argc, char **argv)
 
   std::thread t_send;
   std::thread t_recv;
-  std::thread t_camera;
+  std::array<std::thread, 3> t_cameras;
   std::thread t_gripper;
   int exit_code = 0;
   bool control_diagnostics_valid = false;
@@ -390,8 +420,30 @@ int main(int argc, char **argv)
     //*********** camera thread - follower ***********************************************************
     if (leadorfollow == "f" && record_camera)
     {
-      t_camera = std::thread(multi_camera_thread_func, std::ref(g_multi_cam), std::ref(running), trial_dir.string());
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      g_cameras_ready.store(0);
+      g_camera_capture_failed.store(false);
+      for (int camera_index = 0; camera_index < 3; ++camera_index)
+      {
+        g_camera_committed_frames[camera_index].store(0);
+        t_cameras[camera_index] = std::thread(
+            rgbd_camera_thread_func, camera_index + 1, std::ref(running),
+            trial_dir.string(), camera_serials[camera_index],
+            std::ref(g_cameras_ready), std::ref(g_camera_capture_failed),
+            std::ref(g_camera_committed_frames[camera_index]));
+      }
+      const auto camera_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(15);
+      while (g_cameras_ready.load() < 3 &&
+             !g_camera_capture_failed.load() &&
+             std::chrono::steady_clock::now() < camera_deadline)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      if (g_camera_capture_failed.load() || g_cameras_ready.load() != 3)
+      {
+        running = false;
+        throw std::runtime_error("failed to initialize all three RGB-D cameras");
+      }
     }
     //************************************************************************************************
 
@@ -410,6 +462,20 @@ int main(int argc, char **argv)
       // Read current coriolis terms from model.
       // std::cerr << "1111" << std::endl;
       pandatime += period.toSec();
+
+      if (g_signal_stop_requested)
+      {
+        g_record_active.store(false);
+        throw std::runtime_error(
+            "termination signal received; flushing committed recording data");
+      }
+
+      if (leadorfollow == "f" && g_camera_capture_failed.load())
+      {
+        g_record_active.store(false);
+        throw std::runtime_error(
+            "RGB-D capture failed; stopping the episode with committed data preserved");
+      }
 
       // Once UDP communication has started, stop rather than reusing stale
       // motion commands. Starting the follower before the leader is allowed:
@@ -785,6 +851,7 @@ int main(int argc, char **argv)
           // rec->addToRec(index);
           // rec->addToRec(pandatime);
           // rec->addToRec(remotetime);
+          rec->addToRec(static_cast<double>(steady_time_ns()));
           rec->addToRec(teleop_active_recv);
           rec->addToRec(state.q);
           rec->addToRec(follower_width);
@@ -913,14 +980,70 @@ int main(int argc, char **argv)
   t_send.detach();
   t_recv.detach();
 
-  if (leadorfollow == "f" && t_camera.joinable())
+  if (leadorfollow == "f")
   {
-    t_camera.join();
+    for (auto &camera_thread : t_cameras)
+    {
+      if (camera_thread.joinable())
+      {
+        camera_thread.join();
+      }
+    }
+    if (record_camera && g_camera_capture_failed.load())
+    {
+      exit_code = 1;
+    }
+
+    // Recorder writes DATA_follower.m from its destructor. Close it before the
+    // manifest so complete=true never advertises robot data that is still only
+    // resident in memory.
+    rec.reset();
+
+    if (record_data || record_camera)
+    {
+      const bool robot_data_complete =
+          !record_data ||
+          (fs::is_regular_file(trial_dir / "DATA_follower.m") &&
+           fs::file_size(trial_dir / "DATA_follower.m") > 0);
+      bool camera_data_complete = !record_camera;
+      if (record_camera)
+      {
+        camera_data_complete = !g_camera_capture_failed.load();
+        for (const auto &frame_count : g_camera_committed_frames)
+        {
+          camera_data_complete = camera_data_complete && frame_count.load() > 0;
+        }
+      }
+      json manifest = {
+          {"format", "threading-rgbd-recording-v2"},
+          {"complete", exit_code == 0 && robot_data_complete && camera_data_complete},
+          {"role", "follower"},
+          {"record_data", record_data},
+          {"record_camera", record_camera},
+          {"robot_columns", NoDataRec},
+          {"robot_timestamp_column", "host_steady_timestamp_ns"},
+          {"camera_timestamp_clock", "host_steady_timestamp_ns"},
+          {"depth_encoding", "uint16_z16_aligned_to_color"},
+          {"camera_serials",
+           {{"cam1", camera_serials[0]},
+            {"cam2", camera_serials[1]},
+            {"cam3", camera_serials[2]}}},
+          {"committed_camera_frames",
+           {{"cam1", g_camera_committed_frames[0].load()},
+            {"cam2", g_camera_committed_frames[1].load()},
+            {"cam3", g_camera_committed_frames[2].load()}}}};
+      const fs::path temporary = trial_dir / "recording_manifest.json.tmp";
+      const fs::path final_path = trial_dir / "recording_manifest.json";
+      std::ofstream stream(temporary);
+      stream << manifest.dump(2) << std::endl;
+      stream.close();
+      fs::rename(temporary, final_path);
+    }
   }
   return exit_code;
 }
 
-void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, franka::Gripper &gripper,
+void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool> &running, franka::Gripper &gripper,
                     const std::string &leadorfollow, bool initially_grasped,
                     double grasp_force)
 {
@@ -1161,82 +1284,171 @@ bool movetoGrasp(franka::Gripper &gripper, double target_width,
 
 //=================Camera thread============================================================================
 
-void multi_camera_thread_func(MultiCamSharedData &shared, bool &running, const std::string &out_dir)
+void rgbd_camera_thread_func(
+    int camera_index, std::atomic<bool> &running, const std::string &out_dir,
+    const std::string &camera_serial, std::atomic<int> &ready_count,
+    std::atomic<bool> &capture_failed, std::atomic<uint64_t> &committed_frames)
 {
-  std::cout << "---------------[MultiCamThread] started!-----------\n"
-            << std::endl;
+  const int width = 640;
+  const int height = 480;
+  const int fps = 30;
+  const std::string stem = out_dir + "/cam" + std::to_string(camera_index);
+  uint64_t written_frames = 0;
 
-  RealSenseCam1 cam1(640, 480, 30, "233722072293");
-  RealSenseCam1 cam2(640, 480, 30, "233622071984");
-
-  int frame_id1 = 0;
-  int frame_id2 = 0;
-  cv::VideoWriter writer1;
-  cv::VideoWriter writer2;
-
-  int width = 640;
-  int height = 480;
-  int fps = 30;
-
-  writer1.open(out_dir + "/cam1.mp4", cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps, cv::Size(width, height));
-  writer2.open(out_dir + "/cam2.mp4", cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps, cv::Size(width, height));
-
-  if (!writer1.isOpened() || !writer2.isOpened())
+  try
   {
-    std::cerr << "[MultiCamThread] Failed to open video writers!" << std::endl;
-  }
-
-  while (running)
-  {
-    cv::Mat img1, img2;
-    double ts1_ms = 0.0, ts2_ms = 0.0;
-
-    bool ok1 = cam1.grabColor(img1, ts1_ms);
-    bool ok2 = cam2.grabColor(img2, ts2_ms);
-
+    RealSenseCam1 camera(width, height, fps, camera_serial);
+    cv::VideoWriter rgb_writer(
+        stem + ".mp4", cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+        fps, cv::Size(width, height));
+    const std::string depth_path = stem + "_depth.z16.zst";
+    std::ofstream depth_stream(depth_path, std::ios::binary);
+    std::ofstream timestamps(stem + "_timestamps.csv");
+    if (!rgb_writer.isOpened() || !depth_stream || !timestamps)
     {
-      std::lock_guard<std::mutex> lock(shared.mutex);
-      if (ok1)
+      throw std::runtime_error("could not open RGB-D output files for " + stem);
+    }
+
+    const rs2_intrinsics color = camera.colorIntrinsics();
+    const rs2_intrinsics depth = camera.depthIntrinsics();
+    const rs2_extrinsics depth_to_color = camera.depthToColorExtrinsics();
+    std::array<float, 5> color_coefficients{};
+    std::array<float, 5> depth_coefficients{};
+    std::array<float, 9> depth_to_color_rotation{};
+    std::array<float, 3> depth_to_color_translation{};
+    std::copy_n(color.coeffs, color_coefficients.size(), color_coefficients.begin());
+    std::copy_n(depth.coeffs, depth_coefficients.size(), depth_coefficients.begin());
+    std::copy_n(
+        depth_to_color.rotation, depth_to_color_rotation.size(),
+        depth_to_color_rotation.begin());
+    std::copy_n(
+        depth_to_color.translation, depth_to_color_translation.size(),
+        depth_to_color_translation.begin());
+    json metadata = {
+        {"format", "threading-realsense-rgbd-v1"},
+        {"serial", camera.serial()},
+        {"width", width},
+        {"height", height},
+        {"fps", fps},
+        {"depth_scale_m", camera.depthScaleMeters()},
+        {"depth_aligned_to", "color"},
+        {"depth_storage", "independent zstd frames of row-major uint16 little-endian z16"},
+        {"depth_file", fs::path(depth_path).filename().string()},
+        {"depth_compression", "zstd"},
+        {"depth_compression_level", 1},
+        {"color_intrinsics",
+         {{"width", color.width}, {"height", color.height},
+          {"fx", color.fx}, {"fy", color.fy},
+          {"ppx", color.ppx}, {"ppy", color.ppy},
+          {"model", static_cast<int>(color.model)},
+          {"coeffs", color_coefficients}}},
+        {"native_depth_intrinsics",
+         {{"width", depth.width}, {"height", depth.height},
+          {"fx", depth.fx}, {"fy", depth.fy},
+          {"ppx", depth.ppx}, {"ppy", depth.ppy},
+          {"model", static_cast<int>(depth.model)},
+          {"coeffs", depth_coefficients}}},
+        {"native_depth_to_color",
+         {{"rotation", depth_to_color_rotation},
+          {"translation_m", depth_to_color_translation}}}};
+    {
+      std::ofstream metadata_stream(stem + "_metadata.json");
+      metadata_stream << metadata.dump(2) << std::endl;
+    }
+
+    timestamps << "frame_index,color_frame_number,depth_frame_number,"
+                  "color_sensor_timestamp_ms,depth_sensor_timestamp_ms,"
+                  "host_steady_timestamp_ns,depth_offset_bytes,"
+                  "depth_compressed_bytes\n";
+    ready_count.fetch_add(1);
+
+    const size_t raw_depth_bytes =
+        static_cast<size_t>(width) * height * sizeof(uint16_t);
+    std::vector<uint8_t> compressed_depth(ZSTD_compressBound(raw_depth_bytes));
+
+    while (running)
+    {
+      RealSenseRgbdFrame frame;
+      if (!camera.grabRgbd(frame))
       {
-        shared.color1 = img1.clone();
-        shared.timestamp1_ms = ts1_ms;
-        shared.frame_id1 = frame_id1;
-        shared.has_frame1 = true;
+        throw std::runtime_error("lost RGB-D frame from camera " + camera_serial);
       }
-      if (ok2)
+      if (!g_record_active.load())
       {
-        shared.color2 = img2.clone();
-        shared.timestamp2_ms = ts2_ms;
-        shared.frame_id2 = frame_id2;
-        shared.has_frame2 = true;
+        continue;
+      }
+      if (frame.color_bgr.empty() || frame.depth_z16_aligned_to_color.empty() ||
+          frame.depth_z16_aligned_to_color.type() != CV_16UC1)
+      {
+        throw std::runtime_error("invalid aligned RGB-D frame from " + camera_serial);
+      }
+
+      cv::Mat contiguous_depth = frame.depth_z16_aligned_to_color;
+      if (!contiguous_depth.isContinuous())
+      {
+        contiguous_depth = frame.depth_z16_aligned_to_color.clone();
+      }
+      const size_t compressed_bytes = ZSTD_compress(
+          compressed_depth.data(), compressed_depth.size(),
+          contiguous_depth.ptr<uint16_t>(), raw_depth_bytes, 1);
+      if (ZSTD_isError(compressed_bytes))
+      {
+        throw std::runtime_error(
+            "zstd depth compression failed for " + camera_serial + ": " +
+            ZSTD_getErrorName(compressed_bytes));
+      }
+
+      const std::streampos depth_offset = depth_stream.tellp();
+      if (depth_offset < 0)
+      {
+        throw std::runtime_error("failed getting depth offset for " + camera_serial);
+      }
+      rgb_writer.write(frame.color_bgr);
+      depth_stream.write(
+          reinterpret_cast<const char *>(compressed_depth.data()),
+          static_cast<std::streamsize>(compressed_bytes));
+      if (!depth_stream)
+      {
+        throw std::runtime_error("failed writing depth data for " + camera_serial);
+      }
+      timestamps << written_frames << ',' << frame.color_frame_number << ','
+                 << frame.depth_frame_number << ',' << frame.color_timestamp_ms
+                 << ',' << frame.depth_timestamp_ms << ','
+                 << frame.host_timestamp_ns << ','
+                 << static_cast<uint64_t>(static_cast<std::streamoff>(depth_offset)) << ','
+                 << compressed_bytes << '\n';
+      if (!timestamps)
+      {
+        throw std::runtime_error("failed writing timestamps for " + camera_serial);
+      }
+      ++written_frames;
+      committed_frames.store(written_frames, std::memory_order_release);
+      if (written_frames % 30 == 0)
+      {
+        depth_stream.flush();
+        timestamps.flush();
       }
     }
 
-    if (g_record_active.load())
-    {
-      if (ok1 && writer1.isOpened())
-      {
-        writer1.write(img1);
-      }
-      if (ok2 && writer2.isOpened())
-      {
-        writer2.write(img2);
-      }
-    }
-    frame_id1++;
-    frame_id2++;
+    depth_stream.flush();
+    timestamps.flush();
+    rgb_writer.release();
+    std::cout << "[RGB-D cam" << camera_index << "] saved " << written_frames
+              << " frames from " << camera_serial << std::endl;
   }
-  if (writer1.isOpened())
-    writer1.release();
-  if (writer2.isOpened())
-    writer2.release();
-
-  std::cout << "[MultiCamThread] Stopped." << std::endl;
+  catch (const std::exception &error)
+  {
+    capture_failed.store(true);
+    running = false;
+    std::cerr << "[RGB-D cam" << camera_index << "] " << error.what()
+              << "; preserved " << written_frames << " committed frames"
+              << std::endl;
+  }
 }
 //=======================================================================================================
 
 // Driver code
-void udpwithremote_send(send_data &Data2send, bool &running)
+void udpwithremote_send(send_data &Data2send, std::atomic<bool> &running)
 {
   uint16_t PORTSend = 5001;
 
@@ -1295,7 +1507,7 @@ void udpwithremote_send(send_data &Data2send, bool &running)
   close(sockfd);
 }
 
-void udpwithremote_recv(recv_data &Data2Recv, bool &running)
+void udpwithremote_recv(recv_data &Data2Recv, std::atomic<bool> &running)
 {
   uint16_t PORTRECV = 5001;
 

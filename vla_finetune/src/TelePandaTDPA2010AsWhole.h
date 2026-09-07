@@ -1,9 +1,11 @@
 // Copyright (c) Yansong
 #pragma once
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <condition_variable>
 #include <functional>
@@ -17,6 +19,7 @@
 #include <memory>
 #include <future>
 #include <stdexcept>
+#include <vector>
 
 
 
@@ -49,6 +52,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <zstd.h>
 
 // #include <gram_savitzky_golay/gram_savitzky_golay.h>
 #include "savgol.cpp"
@@ -112,34 +116,19 @@ struct recv_data
 };
 
 
-//=============== Camera Data============================
-struct MultiCamSharedData
-{
-  std::mutex mutex;
+void rgbd_camera_thread_func(
+    int camera_index, std::atomic<bool> &running, const std::string &out_dir,
+    const std::string &camera_serial, std::atomic<int> &ready_count,
+    std::atomic<bool> &capture_failed, std::atomic<uint64_t> &committed_frames);
 
-  //cam1
-  cv::Mat color1;
-  double timestamp1_ms = 0.0;
-  int frame_id1 = -1;
-  bool has_frame1 = false;
-  //cam2
-  cv::Mat color2;
-  double timestamp2_ms = 0.0;
-  int frame_id2 = -1;
-  bool has_frame2 = false;
-};
-//======================================================
+void udpwithremote_send(send_data &Data2Send, std::atomic<bool> &running);
 
-void multi_camera_thread_func(MultiCamSharedData& shared, bool& running, const std::string& out_dir);
-
-void udpwithremote_send(send_data &Data2Send, bool &running);
-
-void udpwithremote_recv(recv_data &Data2Recv, bool &running);
+void udpwithremote_recv(recv_data &Data2Recv, std::atomic<bool> &running);
 
 bool movetoGrasp(franka::Gripper &gripper, double target_width,
                  bool &grasp_flag, bool &ever_grasped, double grasp_force);
 
-void gripperControl(send_data &Data2Send, recv_data &Data2Recv, bool &running, franka::Gripper &gripper,
+void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool> &running, franka::Gripper &gripper,
                    const std::string &leadorfollow, bool initially_grasped,
                    double grasp_force);
 
