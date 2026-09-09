@@ -3,4 +3,4 @@
 	url = git@github.com:Huiyuanliu111/threading_real.git
 [submodule "maze_real"]
 	path = maze_real
-	url = git@gitlab.lrz.de:huiyuan_liu/maze_real.git
+	url = git@github.com:Huiyuanliu111/maze_real.git
