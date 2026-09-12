@@ -98,6 +98,7 @@ struct send_data
   double stop_code = 0;
   std::atomic<double> gripper_width{0.08};
   double teleop_active = 0.0;
+  double episode_phase = 0.0;
 };
 
 struct recv_data
@@ -114,6 +115,7 @@ struct recv_data
   double stop_code = 0;
   double gripper_width = 0.08;
   double teleop_active = 0.0;
+  double episode_phase = 0.0;
 };
 
 
@@ -131,7 +133,7 @@ bool movetoGrasp(franka::Gripper &gripper, double target_width,
 
 void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool> &running, franka::Gripper &gripper,
                    const std::string &leadorfollow, bool initially_grasped,
-                   double grasp_force, bool start_recording_after_grasp);
+                   double grasp_force);
 
 //void check_wiggle_info(wiggle_para & w_para, json parameter);
 

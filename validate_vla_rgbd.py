@@ -45,7 +45,10 @@ def validate_episode(
     if not manifest_path.is_file():
         raise FileNotFoundError(f"missing v2 recording manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("format") != "threading-rgbd-recording-v2":
+    if manifest.get("format") not in {
+        "threading-rgbd-recording-v2",
+        "maze-rgbd-recording-v3",
+    }:
         raise ValueError(f"{trial}: unsupported recording manifest format")
     if manifest.get("role") not in (None, "follower"):
         raise ValueError(f"{trial}: recording manifest is not from the follower")

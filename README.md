@@ -53,7 +53,11 @@ Follower data and camera recording are enabled for collection:
 ```json
 "record_data": true,
 "record_camera": true,
-"recording_start": "first_grasp",
+"maze_cycle": true,
+"automatic_lift_m": 0.02,
+"lift_tolerance_m": 0.001,
+"lift_velocity_tolerance_mps": 0.005,
+"lift_hold_cycles": 200,
 "camera_serials": {
   "cam1": "233722072293",
   "cam2": "233622071984",
@@ -67,20 +71,14 @@ Follower data and camera recording are enabled for collection:
 "gripper_grasp_force": 70.0
 ```
 
-Only the follower writes the recorded files. `gripper_grasp_force` controls the
-follower grasp force in newtons and must be greater than `0` and no more than
-`70`. With `recording_start` set to `first_grasp`, the cameras and robot-state
-recorder are armed at startup but do not write the homing, approach, or grasp
-segments. Recording begins only after the follower confirms the first successful
-grasp, so the saved episode contains the threading segment. Use `immediate` for
-tasks that need the full approach-and-grasp trajectory.
-
-On the `maze_data` branch, the follower configuration also enables
-`lock_tcp_z`. After the initial joint move, the collector reads the current
-`panda_hand_tcp` z once and holds that height for the entire collection. The
-captured value is printed as `[Maze] Locked TCP z ...` and written to
-`recording_manifest.json` as `fixed_tcp_z_m`; no fixed numeric z is stored in
-the configuration.
+Only the follower writes recorded files. `gripper_grasp_force` controls its
+grasp force in newtons and must be greater than `0` and no more than `70`.
+With `maze_cycle` enabled, neither robot performs an automatic joint reset.
+The operator aligns the leader with the stationary follower before the first
+episode. Closing the leader gripper closes the follower gripper, establishes a
+fresh motion baseline, and makes both robots rise 2 cm. Recording starts only
+after both TCPs have settled at their new heights. That follower TCP z is held
+for the episode and saved as `fixed_tcp_z_m`.
 
 ## Controller PC Requirements
 
@@ -247,27 +245,26 @@ on the scene. Record to the follower's local SSD. Do not run
 `trim_invisible_prefix.py` on RGB-D recordings; filter timestamped episodes
 during conversion instead.
 
-For repeated recording, run the loop script on both computers with the same
-trial name and episode count. Start the follower script first, then the leader
-script:
+One pair of processes records repeated episodes. Start the follower process
+first, then the leader process, using the same trial name and starting episode:
 
 ```bash
 # Follower computer
 cd ~/teleoperation/vla_finetune
-./run_teleoperation_episodes.sh f wipe_whiteboard 10
+./build/TelePandaTDPA2010AsWhole 192.168.3.100 f maze_data 1
 ```
 
 ```bash
 # Leader computer
 cd ~/teleoperation/vla_finetune
-./run_teleoperation_episodes.sh l wipe_whiteboard 10
+./build/TelePandaTDPA2010AsWhole 192.168.3.100 l maze_data 1
 ```
 
-After an episode ends, the next episode starts immediately and performs robot
-and gripper initialization again. Pass a fourth argument to start from another
-episode number, for example `... 10 11` starts ten episodes at
-`episode_011`. An episode count of `0` repeats until `Ctrl+C`. The follower
-script refuses to overwrite an existing episode directory.
+The fourth argument is the first episode number. Opening the leader gripper
+ends and flushes the current episode. Keep the processes running, move the
+leader manually to reset both robots, then close the gripper to start the next
+2 cm lift and episode. Episode directories increment automatically. The
+follower refuses to overwrite an existing episode directory.
 
 Do not use Franka Desk guide mode while `robot.control(...)` is running. Guide
 mode or the user stop button aborts the libfranka control command and causes:
@@ -286,9 +283,9 @@ Follower:
 ```text
 [Gripper Init] Homing succeeded.
 [Follower Gripper] Homed. Current width ... m; initial grasp skipped.
-Finished moving to initial joint configuration.
+[Maze] No automatic joint reset. Align the leader with the follower manually, then close the leader gripper.
 TDPA initialize done
-[Recording] Armed; waiting for the first successful grasp.
+[Recording] Waiting for leader gripper close.
 ```
 
 Leader:
@@ -296,18 +293,15 @@ Leader:
 ```text
 [Gripper Init] Homing succeeded.
 [Leader Gripper] Homed and left open at width ... m.
-Finished moving to initial joint configuration.
+[Maze] No automatic joint reset. Align the leader with the follower manually, then close the leader gripper.
 TDPA initialize done
 ```
 
-After startup, the follower ignores closed or stale initial values. It first
-confirms that the leader gripper is open, then treats a confirmed open-to-close
-transition as one grasp command. A failed grasp is attempted only once; the
-leader must reopen and close again before another attempt.
-
-For the Threading configuration, a successful first grasp prints
-`[Recording] Started after the first successful grasp.` and opens the shared
-robot/RGB-D recording gate. Frames captured before that point are discarded.
+After startup, the program first confirms that the leader gripper is open. A
+confirmed close starts the synchronized lift. Expected transition logs include
+`[Maze] Close confirmed`, `[Recording] Started episode ... after both robots
+reached z=...`, and, after opening, `[Maze] Episode ended ... close again for
+next episode`.
 
 Both sides should also print UDP receive diagnostics:
 
@@ -315,10 +309,9 @@ Both sides should also print UDP receive diagnostics:
 [UDP recv] packets=... from=... q_delta_norm=... dq_norm=...
 ```
 
-Both robots move to the low collection posture
-`[0.307272, 0.323924, -0.112529, -2.501686, -0.012559, 2.764401, 0.833281]`
-rad before teleoperation starts. This is the same default start posture used by
-the `threading_real` deployment scripts.
+There is no predefined initial joint posture. Before the first close, the
+follower holds the pose it had when the process started while the leader can be
+positioned manually. Every close re-zeros the leader/follower motion mapping.
 
 Before collecting a full dataset, record two or three episodes and validate
 all committed RGB-D frames and timestamp joins. Raw acquisition stays on the

@@ -8,7 +8,11 @@
     "n_data_record": 100,
     "record_data": true,
     "record_camera": true,
-    "recording_start": "first_grasp",
+    "maze_cycle": true,
+    "automatic_lift_m": 0.02,
+    "lift_tolerance_m": 0.001,
+    "lift_velocity_tolerance_mps": 0.005,
+    "lift_hold_cycles": 200,
     "camera_serials": {
         "cam1": "233722072293",
         "cam2": "233622071984",

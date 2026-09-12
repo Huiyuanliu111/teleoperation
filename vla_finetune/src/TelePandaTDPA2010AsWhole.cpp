@@ -23,10 +23,39 @@ std::atomic<bool> g_stop_requested{false};
 std::atomic<double> g_follower_gripper_width{0.0};
 std::atomic<int> g_cameras_ready{0};
 std::atomic<bool> g_camera_capture_failed{false};
+std::atomic<bool> g_camera_episode_running{false};
+std::atomic<int> g_episode_phase{0};
+std::atomic<double> g_lift_target_z{std::numeric_limits<double>::quiet_NaN()};
 std::array<std::atomic<uint64_t>, 3> g_camera_committed_frames = {
     std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0},
     std::atomic<uint64_t>{0}};
 volatile std::sig_atomic_t g_signal_stop_requested = 0;
+
+enum EpisodePhase
+{
+  kResetOrAlign = 0,
+  kCloseDetected = 1,
+  kLifting = 2,
+  kLiftReady = 3,
+  kRecording = 4,
+};
+
+std::mutex g_record_mutex;
+std::unique_ptr<Recorder> g_episode_recorder;
+std::array<std::thread, 3> g_camera_threads;
+fs::path g_recording_base_dir;
+fs::path g_current_episode_dir;
+std::string g_recording_trial_name;
+int g_next_episode_index = 1;
+bool g_record_data_enabled = false;
+bool g_record_camera_enabled = false;
+std::array<std::string, 3> g_recording_camera_serials;
+std::array<bool, 3> g_recording_camera_enabled = {true, true, true};
+int g_recording_enabled_camera_count = 3;
+double g_automatic_lift_m = 0.02;
+constexpr int kRobotRecordColumns = 30;
+constexpr double kInitialRecordSeconds = 30.0;
+constexpr double kRobotRecordSampleSeconds = 0.001;
 
 extern "C" void request_graceful_stop(int)
 {
@@ -98,15 +127,7 @@ int main(int argc, char **argv)
   fs::path base_dir = project_dir / "data";
   fs::path trial_dir = base_dir / trial_name / format_episode_dir(episode_idx);
 
-  if (leadorfollow == "f")
-  {
-    fs::create_directories(trial_dir);
-  }
-
-  // fs::create_directories(trial_dir);
-
-
-  std::cout << "[TelePanda] trial_dir = " << trial_dir << std::endl;
+  std::cout << "[TelePanda] first episode path = " << trial_dir << std::endl;
   // =================== data directory per trial ===================
 
   /* Read and parse JSON file parameters */
@@ -130,16 +151,6 @@ int main(int argc, char **argv)
   bool tau_ext_feedback = parameter["tau_ext_feedback"];
   bool record_data = parameter.value("record_data", false);
   bool record_camera = parameter.value("record_camera", false);
-  const std::string recording_start =
-      parameter.value("recording_start", std::string("immediate"));
-  if (recording_start != "immediate" && recording_start != "first_grasp")
-  {
-    std::cerr << "recording_start must be either 'immediate' or 'first_grasp'"
-              << std::endl;
-    return -1;
-  }
-  const bool start_recording_after_grasp =
-      leadorfollow == "f" && recording_start == "first_grasp";
   std::array<std::string, 3> camera_serials = {
       "233722072293", "233622071984", "233522077069"};
   std::array<bool, 3> camera_enabled = {true, true, true};
@@ -180,21 +191,38 @@ int main(int argc, char **argv)
     std::cerr << "gripper_grasp_force must be in the range (0, 70] N" << std::endl;
     return -1;
   }
-  const bool lock_tcp_z = leadorfollow == "f" &&
-                          parameter.value("lock_tcp_z", false);
+  const bool maze_cycle = parameter.value("maze_cycle", false);
+  const bool lock_tcp_z = parameter.value("lock_tcp_z", maze_cycle);
+  const double automatic_lift_m = parameter.value("automatic_lift_m", 0.02);
+  const double lift_tolerance_m = parameter.value("lift_tolerance_m", 0.001);
+  const double lift_velocity_tolerance_mps =
+      parameter.value("lift_velocity_tolerance_mps", 0.005);
+  const int lift_hold_cycles = parameter.value("lift_hold_cycles", 200);
   const double tcp_z_stiffness =
       parameter.value("tcp_z_stiffness", 1000.0);
   const double tcp_z_damping = parameter.value(
       "tcp_z_damping", 2.0 * std::sqrt(tcp_z_stiffness));
-  if (lock_tcp_z && (tcp_z_stiffness <= 0.0 || tcp_z_damping < 0.0 ||
+  if (maze_cycle && (!lock_tcp_z || automatic_lift_m <= 0.0 ||
+                     lift_tolerance_m <= 0.0 ||
+                     lift_velocity_tolerance_mps <= 0.0 || lift_hold_cycles <= 0 ||
+                     tcp_z_stiffness <= 0.0 || tcp_z_damping < 0.0 ||
                      !std::isfinite(tcp_z_stiffness) ||
                      !std::isfinite(tcp_z_damping)))
   {
-    std::cerr << "tcp_z_stiffness must be positive and tcp_z_damping must "
-                 "be non-negative"
+    std::cerr << "invalid maze lift or TCP z controller configuration"
               << std::endl;
     return -1;
   }
+
+  g_recording_base_dir = base_dir;
+  g_recording_trial_name = trial_name;
+  g_next_episode_index = episode_idx;
+  g_record_data_enabled = leadorfollow == "f" && record_data;
+  g_record_camera_enabled = leadorfollow == "f" && record_camera;
+  g_recording_camera_serials = camera_serials;
+  g_recording_camera_enabled = camera_enabled;
+  g_recording_enabled_camera_count = enabled_camera_count;
+  g_automatic_lift_m = automatic_lift_m;
   double gain_tau_ld;
   double gain_dq_l;
   double gain_tau_f;
@@ -254,28 +282,8 @@ int main(int argc, char **argv)
   std::atomic<bool> running{true};
 
   // recording data
-  int index = 0;
-  double t_rec = 30;
-  double SampletimeInit = 0.001;
-  // const int NoDataRec = 106;
   // v2 prepends host_steady_timestamp_ns to the legacy 29 columns. Camera
   // timestamp CSV files use the same clock for exact nearest-neighbour joins.
-  const int NoDataRec = 30;
-  std::mutex record_mutex;
-  std::unique_ptr<Recorder> rec;
-
-  if (leadorfollow == "f" && record_data)
-  {
-    std::string data_name = (trial_dir / "DATA_follower").string();
-    rec = std::make_unique<Recorder>(t_rec, SampletimeInit, NoDataRec, data_name);
-    //rec = std::make_unique<Recorder>(NoDataRec, data_name);
-  }
-
-  // std::string data_name = (trial_dir / (leadorfollow == "l" ? "DATA_leader" : "DATA_follower")).string();
-  // rec = std::make_unique<Recorder>(t_rec, SampletimeInit, NoDataRec, data_name);
-
-
-
   std::array<double, 7> q_local_delta{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> dq_local = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> q_remote_delta = {{0, 0, 0, 0, 0, 0, 0}};
@@ -303,14 +311,14 @@ int main(int argc, char **argv)
   g_record_active.store(false);
   g_record_started.store(false);
   g_record_start_time_ns.store(0);
+  g_episode_phase.store(kResetOrAlign);
+  g_lift_target_z.store(std::numeric_limits<double>::quiet_NaN());
 
   std::thread t_send;
   std::thread t_recv;
-  std::array<std::thread, 3> t_cameras;
   std::thread t_gripper;
   int exit_code = 0;
   bool control_diagnostics_valid = false;
-  double fixed_tcp_z = std::numeric_limits<double>::quiet_NaN();
   std::array<double, 7> last_q_measured = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> last_q_desired = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> last_q_remote_delta = {{0, 0, 0, 0, 0, 0, 0}};
@@ -347,22 +355,6 @@ int main(int argc, char **argv)
     std::cout << "q0=" << initial_state.q << std::endl;
     std::cout << "x0=" << position_ini << std::endl;
 
-    // First move the robot to a suitable joint configuration
-    // std::array<double, 7> q_goal = {{0, -M_PI_4, 0, -3 * M_PI_4, 0, M_PI_2, M_PI_4}}; //default config
-    // Low collection posture captured from the follower on 2026-09-04. Keep
-    // this aligned with threading_real/scripts/deploy_threading_real.py so
-    // data collection and policy deployment start from the same pose.
-    std::array<double, 7> q_goal = {{0.307272, 0.323924, -0.112529, -2.501686, -0.012559, 2.764401, 0.833281}};
-    // std::array<double, 7> q_goal = {{0, M_PI / 6, 0, -2 * M_PI_4, 0, M_PI_2, M_PI_4}};
-
-    std::cout << "error recover." << std::endl;
-
-    MotionGenerator motion_generator(0.05, q_goal);
-    std::cout << "WARNING: This example will move the robot! "
-              << "Please make sure to have the user stop button at hand!" << std::endl
-              << std::endl;
-    // std::cin.ignore();
-
     bool follower_initially_grasped = false;
     std::cout << "[Gripper Init] Connecting to gripper at " << robot_ip << "..." << std::endl;
     gripper_ptr = std::make_unique<franka::Gripper>(robot_ip);
@@ -394,27 +386,18 @@ int main(int argc, char **argv)
     }
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
-    robot.control(motion_generator);
-    std::cout << "Finished moving to initial joint configuration." << std::endl;
+    std::cout << "[Maze] No automatic joint reset. Align the leader with the "
+                 "follower manually, then close the leader gripper."
+              << std::endl;
 
     t_gripper = std::thread(gripperControl, std::ref(Data2Send), std::ref(Data2Recv),
                             std::ref(running), std::ref(*gripper_ptr), leadorfollow,
-                            follower_initially_grasped, gripper_grasp_force,
-                            start_recording_after_grasp);
+                            follower_initially_grasped, gripper_grasp_force);
 
     // Load the kinematics and dynamics model.
     franka::Model model = robot.loadModel();
 
     initial_state = robot.readOnce();
-    if (lock_tcp_z)
-    {
-      const Eigen::Matrix4d collection_start_pose =
-          Kinematics::ForwardKinematics(initial_state.q.data(),
-                                        kPandaHandTcpOffsetM);
-      fixed_tcp_z = collection_start_pose(2, 3);
-      std::cout << "[Maze] Locked TCP z for this collection: " << fixed_tcp_z
-                << " m" << std::endl;
-    }
     // Bias torque sensor
     std::cout << "q=" << initial_state.q << std::endl;
     std::cout << std::endl;
@@ -479,61 +462,16 @@ int main(int argc, char **argv)
     ///////////         TDPA stuff end         ///////////////////////////
     //////////////////////////////////////////////////////////////////////////////////////////
 
-    //*********** camera thread - follower ***********************************************************
-    if (leadorfollow == "f" && record_camera)
-    {
-      g_cameras_ready.store(0);
-      g_camera_capture_failed.store(false);
-      for (int camera_index = 0; camera_index < 3; ++camera_index)
-      {
-        g_camera_committed_frames[camera_index].store(0);
-        if (!camera_enabled[camera_index])
-        {
-          std::cout << "[RGB-D cam" << camera_index + 1
-                    << "] disabled by configuration." << std::endl;
-          continue;
-        }
-        t_cameras[camera_index] = std::thread(
-            rgbd_camera_thread_func, camera_index + 1, std::ref(running),
-            trial_dir.string(), camera_serials[camera_index],
-            std::ref(g_cameras_ready), std::ref(g_camera_capture_failed),
-            std::ref(g_camera_committed_frames[camera_index]));
-      }
-      const auto camera_deadline =
-          std::chrono::steady_clock::now() + std::chrono::seconds(15);
-      while (g_cameras_ready.load() < enabled_camera_count &&
-             !g_camera_capture_failed.load() &&
-             std::chrono::steady_clock::now() < camera_deadline)
-      {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      }
-      if (g_camera_capture_failed.load() ||
-          g_cameras_ready.load() != enabled_camera_count)
-      {
-        running = false;
-        throw std::runtime_error("failed to initialize all enabled RGB-D cameras");
-      }
-    }
-    //************************************************************************************************
-
-    // Start immediately for legacy tasks, or wait until the follower has
-    // confirmed its first grasp so Threading recordings contain insertion only.
-    if ((record_data || record_camera) && !start_recording_after_grasp)
-    {
-      g_record_start_time_ns.store(steady_time_ns());
-      g_record_started.store(true);
-      g_record_active.store(true);
-    }
-    else if (record_data || record_camera)
-    {
-      std::cout << "[Recording] Armed; waiting for the first successful grasp."
-                << std::endl;
-    }
+    std::cout << "[Recording] Waiting for leader gripper close." << std::endl;
 
     ////////////////////// Define callback for the joint torque control
     /// loop.//////////////////////////////////////////////////////////////////////
 
     int leader_stop_ack_count = 0;
+    std::array<double, 7> teleop_joint_baseline = initial_state.q;
+    bool teleop_enabled = false;
+    int lift_settle_cycles = 0;
+    int remote_episode_phase = kResetOrAlign;
     std::function<franka::Torques(const franka::RobotState &, franka::Duration)>
         impedance_control_callback = [&](const franka::RobotState &state,
                                          franka::Duration period /*period*/) -> franka::Torques
@@ -587,6 +525,11 @@ int main(int argc, char **argv)
       Eigen::Vector3d position(transform.translation());
       Eigen::Map<const Eigen::Matrix<double, 7, 1>> tau_J_d_eig(state.tau_J_d.data());
       Eigen::Map<const Eigen::Matrix<double, 7, 1>> dq_eig(state.dq.data());
+      const Eigen::Matrix<double, 6, 7> tcp_jacobian =
+          Kinematics::ComputeJacobian(state.q.data(), kPandaHandTcpOffsetM);
+      const Eigen::Matrix<double, 1, 7> z_jacobian = tcp_jacobian.row(2);
+      const Eigen::Matrix4d tcp_pose =
+          Kinematics::ForwardKinematics(state.q.data(), kPandaHandTcpOffsetM);
       // external wrench acting on stiffness frame, expressed relative to the stiffness frame.
       Eigen::Map<const Eigen::Matrix<double, 6, 1>> K_F_ext_hat_K(state.K_F_ext_hat_K.data());
 
@@ -674,6 +617,7 @@ int main(int argc, char **argv)
           tau_remote = Data2Recv.tau_remote;
           f_remote = Data2Recv.f_remote;
           E_F_in_delayed = Data2Recv.energy;
+          remote_episode_phase = static_cast<int>(Data2Recv.episode_phase);
 
           Data2Recv.mutex.unlock();
         }
@@ -689,16 +633,29 @@ int main(int argc, char **argv)
           f_remote = Data2Recv.f_remote;
           E_L_in_delayed = Data2Recv.energy;
           teleop_active_recv = Data2Recv.teleop_active;
+          remote_episode_phase = static_cast<int>(Data2Recv.episode_phase);
 
           Data2Recv.mutex.unlock();
         }
       }
 
+      if (maze_cycle && g_episode_phase.load() == kCloseDetected &&
+          remote_episode_phase >= kCloseDetected &&
+          remote_episode_phase <= kLifting)
+      {
+        teleop_joint_baseline = state.q;
+        teleop_enabled = true;
+        lift_settle_cycles = 0;
+        g_lift_target_z.store(tcp_pose(2, 3) + automatic_lift_m);
+        g_episode_phase.store(kLifting);
+      }
+
       std::array<double, 7> q_des;
       for (size_t i = 0; i < 7; i++)
       {
-        q_local_delta[i] = state.q[i] - initial_state.q[i];
-        // q_des[i] = initial_state.q[i] + q_remote_delta[i];
+        q_local_delta[i] = teleop_enabled
+                               ? state.q[i] - teleop_joint_baseline[i]
+                               : 0.0;
       }
 
       //////////////////////////////////////////////////////////////////////////////////////////
@@ -778,10 +735,22 @@ int main(int argc, char **argv)
 
         for (size_t i = 0; i < 7; i++)
         {
-          // Track the leader's measured position delta directly. Integrating
-          // remote velocity here allowed noise, packet loss, and stale values
-          // to accumulate into an unbounded follower position target.
-          q_des[i] = initial_state.q[i] + q_remote_delta[i];
+          // Re-zero both robots at every close event. Before the first close,
+          // hold the follower still while the operator aligns the leader.
+          // The peer publishes its phase and re-zeroed joint delta in one UDP
+          // packet. Hold this robot at the freshly captured baseline until
+          // that packet arrives, so a previous episode's delta cannot be
+          // applied during the close handshake.
+          const bool remote_baseline_ready =
+              g_episode_phase.load() != kLifting ||
+              remote_episode_phase >= kLifting;
+          q_des[i] = teleop_enabled && remote_baseline_ready
+                         ? teleop_joint_baseline[i] + q_remote_delta[i]
+                         : teleop_joint_baseline[i];
+          if (!teleop_enabled || !remote_baseline_ready)
+          {
+            dq_des_double[i] = 0.0;
+          }
           position_error[i] = q_local_delta[i] - q_remote_delta[i];
         }
 
@@ -825,33 +794,49 @@ int main(int argc, char **argv)
       }
       else if (leadorfollow == "f")
       {
-        if (lock_tcp_z)
+        tau_d_calculated = tau_c;
+      }
+
+      int local_episode_phase = g_episode_phase.load();
+      if (leadorfollow == "l" && local_episode_phase == kLiftReady &&
+          remote_episode_phase == kRecording)
+      {
+        g_episode_phase.store(kRecording);
+        local_episode_phase = kRecording;
+      }
+      const bool hold_lift_height = maze_cycle && lock_tcp_z &&
+                                    local_episode_phase >= kLifting;
+      if (hold_lift_height)
+      {
+        const double target_z = g_lift_target_z.load();
+        const double z_velocity = (z_jacobian * dq_eig)(0);
+        const double z_error = target_z - tcp_pose(2, 3);
+        const double denominator = z_jacobian.squaredNorm() + 1e-9;
+        Eigen::Map<const Eigen::Matrix<double, 7, 1>> nominal_torque(
+            tau_d_calculated.data());
+        Eigen::Matrix<double, 7, 1> constrained_torque = nominal_torque;
+        constrained_torque -= z_jacobian.transpose() *
+                              ((z_jacobian * nominal_torque)(0) / denominator);
+        const double z_force = tcp_z_stiffness * z_error -
+                               tcp_z_damping * z_velocity;
+        constrained_torque += z_jacobian.transpose() * z_force;
+        Eigen::VectorXd::Map(tau_d_calculated.data(), 7) = constrained_torque;
+
+        if (local_episode_phase == kLifting)
         {
-          // Give the planar z task priority over the leader's joint-space
-          // motion. Remove the direct z component of the joint tracking
-          // torque, then add a Cartesian spring-damper at the TCP height read
-          // immediately before this collection starts.
-          const Eigen::Matrix<double, 6, 7> tcp_jacobian =
-              Kinematics::ComputeJacobian(state.q.data(),
-                                          kPandaHandTcpOffsetM);
-          const Eigen::Matrix<double, 1, 7> z_jacobian = tcp_jacobian.row(2);
-          const Eigen::Matrix4d tcp_pose =
-              Kinematics::ForwardKinematics(state.q.data(),
-                                            kPandaHandTcpOffsetM);
-          const double denominator = z_jacobian.squaredNorm() + 1e-9;
-          Eigen::Map<const Eigen::Matrix<double, 7, 1>> joint_torque(tau_c.data());
-          Eigen::Matrix<double, 7, 1> constrained_torque = joint_torque;
-          constrained_torque -= z_jacobian.transpose() *
-                                ((z_jacobian * joint_torque)(0) / denominator);
-          const double z_velocity = (z_jacobian * dq_eig)(0);
-          const double z_force = tcp_z_stiffness * (fixed_tcp_z - tcp_pose(2, 3)) -
-                                 tcp_z_damping * z_velocity;
-          constrained_torque += z_jacobian.transpose() * z_force;
-          Eigen::VectorXd::Map(tau_d_calculated.data(), 7) = constrained_torque;
-        }
-        else
-        {
-          tau_d_calculated = tau_c;
+          if (std::abs(z_error) <= lift_tolerance_m &&
+              std::abs(z_velocity) <= lift_velocity_tolerance_mps)
+          {
+            ++lift_settle_cycles;
+            if (lift_settle_cycles >= lift_hold_cycles)
+            {
+              g_episode_phase.store(kLiftReady);
+            }
+          }
+          else
+          {
+            lift_settle_cycles = 0;
+          }
         }
       }
 
@@ -911,6 +896,9 @@ int main(int argc, char **argv)
             Data2Send.energy = E_F_in;
           }
 
+          Data2Send.episode_phase =
+              static_cast<double>(g_episode_phase.load());
+
           send_allowed = true;
           send_data_updated = true;
         }
@@ -921,17 +909,16 @@ int main(int argc, char **argv)
       }
 
       // Logging Data
-      if (leadorfollow == "f" && rec && g_record_active.load())
-      // if (rec && g_record_active.load())
+      if (leadorfollow == "f" && g_record_data_enabled &&
+          g_record_active.load())
       {
-        if(record_mutex.try_lock())
+        if(g_record_mutex.try_lock())
         {
-
           double follower_width = g_follower_gripper_width.load();
 
           std::array<double, 7> leader_q;
           for (int i = 0; i < 7; ++i){
-            leader_q[i] = initial_state.q[i] + q_remote_delta[i];
+            leader_q[i] = teleop_joint_baseline[i] + q_remote_delta[i];
           }
           // Eigen::VectorXd row(15);
           // int c = 0;
@@ -949,17 +936,17 @@ int main(int argc, char **argv)
           // rec->addToRec(index);
           // rec->addToRec(pandatime);
           // rec->addToRec(remotetime);
-          rec->addToRec(static_cast<double>(steady_time_ns()));
-          rec->addToRec(teleop_active_recv);
-          rec->addToRec(state.q);
-          rec->addToRec(follower_width);
-          rec->addToRec(state.K_F_ext_hat_K);
+          g_episode_recorder->addToRec(static_cast<double>(steady_time_ns()));
+          g_episode_recorder->addToRec(teleop_active_recv);
+          g_episode_recorder->addToRec(state.q);
+          g_episode_recorder->addToRec(follower_width);
+          g_episode_recorder->addToRec(state.K_F_ext_hat_K);
           // rec->addToRec(q_local_delta); // q_local_delta
           // rec->addToRec(q_remote_delta);
           // rec->addToRec(dq_local);
           // rec->addToRec(dq_remote);
-          rec->addToRec(leader_q); // leader joint trajectory
-          rec->addToRec(tau_ext);
+          g_episode_recorder->addToRec(leader_q); // leader joint trajectory
+          g_episode_recorder->addToRec(tau_ext);
           // rec->addToRec(tau_c.data(), 7);
           // rec->addToRec(tau_remote);
           // rec->addToRec(f_local);
@@ -980,10 +967,9 @@ int main(int argc, char **argv)
           // rec->addToRec(position);
 
         
-          rec->next();
+          g_episode_recorder->next();
 
-          index++;
-          record_mutex.unlock();
+          g_record_mutex.unlock();
         }
       }
 
@@ -1045,15 +1031,16 @@ int main(int argc, char **argv)
         servaddr.sin_port = htons(PORTSend);
         servaddr.sin_addr.s_addr = inet_addr(IP_remote);
 
-        // Keep emergency stop packets compatible with the normal 32-double
-        // UDP protocol. A legacy 30-double packet is rejected by the peer and
+        // Keep emergency stop packets compatible with the normal 33-double
+        // UDP protocol. A legacy packet is rejected by the peer and
         // would make the peer report a watchdog timeout instead of stopping.
-        const int NoDatatosend = 32;
+        const int NoDatatosend = 33;
         double msg2send[NoDatatosend] = {0};
 
         msg2send[29] = 1.0;
         msg2send[30] = g_follower_gripper_width.load();
         msg2send[31] = 0.0;
+        msg2send[32] = static_cast<double>(kResetOrAlign);
 
         for (int k = 0; k < 20; k++)
         {
@@ -1080,255 +1067,296 @@ int main(int argc, char **argv)
 
   if (leadorfollow == "f")
   {
-    for (auto &camera_thread : t_cameras)
+    g_camera_episode_running.store(false);
+    for (auto &camera_thread : g_camera_threads)
     {
       if (camera_thread.joinable())
       {
         camera_thread.join();
       }
     }
-    if (record_camera && g_camera_capture_failed.load())
-    {
-      exit_code = 1;
-    }
-
-    // Recorder writes DATA_follower.m from its destructor. Close it before the
-    // manifest so complete=true never advertises robot data that is still only
-    // resident in memory.
-    rec.reset();
-
-    if (record_data || record_camera)
-    {
-      const bool robot_data_complete =
-          !record_data ||
-          (fs::is_regular_file(trial_dir / "DATA_follower.m") &&
-           fs::file_size(trial_dir / "DATA_follower.m") > 0);
-      bool camera_data_complete = !record_camera;
-      if (record_camera)
-      {
-        camera_data_complete = !g_camera_capture_failed.load();
-        for (size_t camera_index = 0; camera_index < camera_enabled.size(); ++camera_index)
-        {
-          if (camera_enabled[camera_index])
-          {
-            camera_data_complete = camera_data_complete &&
-                                   g_camera_committed_frames[camera_index].load() > 0;
-          }
-        }
-      }
-      json recorded_cameras = json::array();
-      json recorded_camera_serials = json::object();
-      json committed_camera_frames = json::object();
-      for (size_t camera_index = 0; camera_index < camera_enabled.size(); ++camera_index)
-      {
-        if (!camera_enabled[camera_index])
-        {
-          continue;
-        }
-        const std::string camera_name = "cam" + std::to_string(camera_index + 1);
-        recorded_cameras.push_back(camera_name);
-        recorded_camera_serials[camera_name] = camera_serials[camera_index];
-        committed_camera_frames[camera_name] =
-            g_camera_committed_frames[camera_index].load();
-      }
-      json manifest = {
-          {"format", "threading-rgbd-recording-v2"},
-          {"complete", exit_code == 0 && g_record_started.load() &&
-                           robot_data_complete && camera_data_complete},
-          {"role", "follower"},
-          {"record_data", record_data},
-          {"record_camera", record_camera},
-          {"recording_start", recording_start},
-          {"recording_started", g_record_started.load()},
-          {"recording_start_host_steady_timestamp_ns",
-           g_record_start_time_ns.load()},
-          {"lock_tcp_z", lock_tcp_z},
-          {"fixed_tcp_z_m", lock_tcp_z ? json(fixed_tcp_z) : json(nullptr)},
-          {"fixed_tcp_frame", lock_tcp_z ? json("panda_hand_tcp") : json(nullptr)},
-          {"robot_columns", NoDataRec},
-          {"robot_timestamp_column", "host_steady_timestamp_ns"},
-          {"camera_timestamp_clock", "host_steady_timestamp_ns"},
-          {"depth_encoding", "uint16_z16_aligned_to_color"},
-          {"recorded_cameras", recorded_cameras},
-          {"camera_serials", recorded_camera_serials},
-          {"committed_camera_frames", committed_camera_frames}};
-      const fs::path temporary = trial_dir / "recording_manifest.json.tmp";
-      const fs::path final_path = trial_dir / "recording_manifest.json";
-      std::ofstream stream(temporary);
-      stream << manifest.dump(2) << std::endl;
-      stream.close();
-      fs::rename(temporary, final_path);
-    }
+    std::lock_guard<std::mutex> lock(g_record_mutex);
+    g_episode_recorder.reset();
   }
   return exit_code;
 }
 
 void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool> &running, franka::Gripper &gripper,
                     const std::string &leadorfollow, bool initially_grasped,
-                    double grasp_force, bool start_recording_after_grasp)
+                    double grasp_force)
 {
+  (void)Data2Send;
+  (void)initially_grasped;
+  constexpr double close_threshold = 0.005;
+  constexpr double open_threshold = 0.02;
+  constexpr int required_state_samples = 5;
+  bool close_armed = false;
+  bool cycle_in_progress = false;
+  bool episode_open = false;
+  int open_samples = 0;
+  int close_samples = 0;
+  int leader_width_print_count = 0;
+
+  auto join_episode_cameras = [&]()
+  {
+    g_camera_episode_running.store(false);
+    for (auto &camera_thread : g_camera_threads)
+    {
+      if (camera_thread.joinable())
+      {
+        camera_thread.join();
+      }
+    }
+  };
+
+  auto finish_episode = [&](bool requested_complete)
+  {
+    if (!episode_open)
+    {
+      return;
+    }
+    g_record_active.store(false);
+    join_episode_cameras();
+    {
+      std::lock_guard<std::mutex> lock(g_record_mutex);
+      g_episode_recorder.reset();
+    }
+
+    const bool robot_data_complete =
+        !g_record_data_enabled ||
+        (fs::is_regular_file(g_current_episode_dir / "DATA_follower.m") &&
+         fs::file_size(g_current_episode_dir / "DATA_follower.m") > 0);
+    bool camera_data_complete = !g_record_camera_enabled ||
+                                !g_camera_capture_failed.load();
+    json recorded_cameras = json::array();
+    json recorded_camera_serials = json::object();
+    json committed_camera_frames = json::object();
+    for (size_t camera_index = 0;
+         camera_index < g_recording_camera_enabled.size(); ++camera_index)
+    {
+      if (!g_record_camera_enabled ||
+          !g_recording_camera_enabled[camera_index])
+      {
+        continue;
+      }
+      const std::string camera_name = "cam" + std::to_string(camera_index + 1);
+      const uint64_t frames = g_camera_committed_frames[camera_index].load();
+      recorded_cameras.push_back(camera_name);
+      recorded_camera_serials[camera_name] =
+          g_recording_camera_serials[camera_index];
+      committed_camera_frames[camera_name] = frames;
+      camera_data_complete = camera_data_complete && frames > 0;
+    }
+    json manifest = {
+        {"format", "maze-rgbd-recording-v3"},
+        {"complete", requested_complete && g_record_started.load() &&
+                         robot_data_complete && camera_data_complete},
+        {"role", "follower"},
+        {"record_data", g_record_data_enabled},
+        {"record_camera", g_record_camera_enabled},
+        {"recording_start", "after_both_robots_lifted"},
+        {"recording_started", g_record_started.load()},
+        {"recording_start_host_steady_timestamp_ns",
+         g_record_start_time_ns.load()},
+        {"automatic_lift_m", g_automatic_lift_m},
+        {"fixed_tcp_z_m", g_lift_target_z.load()},
+        {"fixed_tcp_frame", "panda_hand_tcp"},
+        {"robot_columns", kRobotRecordColumns},
+        {"robot_timestamp_column", "host_steady_timestamp_ns"},
+        {"camera_timestamp_clock", "host_steady_timestamp_ns"},
+        {"depth_encoding", "uint16_z16_aligned_to_color"},
+        {"recorded_cameras", recorded_cameras},
+        {"camera_serials", recorded_camera_serials},
+        {"committed_camera_frames", committed_camera_frames}};
+    const fs::path temporary = g_current_episode_dir / "recording_manifest.json.tmp";
+    const fs::path final_path = g_current_episode_dir / "recording_manifest.json";
+    std::ofstream stream(temporary);
+    stream << manifest.dump(2) << std::endl;
+    stream.close();
+    fs::rename(temporary, final_path);
+    std::cout << "[Recording] Episode " << g_next_episode_index
+              << " saved at " << g_current_episode_dir << std::endl;
+    ++g_next_episode_index;
+    episode_open = false;
+    g_current_episode_dir.clear();
+    g_record_started.store(false);
+    g_record_start_time_ns.store(0);
+  };
+
+  auto prepare_episode = [&]()
+  {
+    g_current_episode_dir = g_recording_base_dir / g_recording_trial_name /
+                            format_episode_dir(g_next_episode_index);
+    if (fs::exists(g_current_episode_dir))
+    {
+      throw std::runtime_error("refusing to overwrite existing episode " +
+                               g_current_episode_dir.string());
+    }
+    fs::create_directories(g_current_episode_dir);
+    episode_open = true;
+    g_record_active.store(false);
+    g_record_started.store(false);
+    g_record_start_time_ns.store(0);
+    g_camera_capture_failed.store(false);
+    g_cameras_ready.store(0);
+    for (auto &count : g_camera_committed_frames)
+    {
+      count.store(0);
+    }
+    if (g_record_data_enabled)
+    {
+      std::lock_guard<std::mutex> lock(g_record_mutex);
+      g_episode_recorder = std::make_unique<Recorder>(
+          kInitialRecordSeconds, kRobotRecordSampleSeconds,
+          kRobotRecordColumns,
+          (g_current_episode_dir / "DATA_follower").string());
+    }
+    if (g_record_camera_enabled)
+    {
+      g_camera_episode_running.store(true);
+      for (int camera_index = 0; camera_index < 3; ++camera_index)
+      {
+        if (!g_recording_camera_enabled[camera_index])
+        {
+          continue;
+        }
+        g_camera_threads[camera_index] = std::thread(
+            rgbd_camera_thread_func, camera_index + 1, std::ref(running),
+            g_current_episode_dir.string(),
+            g_recording_camera_serials[camera_index],
+            std::ref(g_cameras_ready), std::ref(g_camera_capture_failed),
+            std::ref(g_camera_committed_frames[camera_index]));
+      }
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(15);
+      while (running &&
+             g_cameras_ready.load() < g_recording_enabled_camera_count &&
+             !g_camera_capture_failed.load() &&
+             std::chrono::steady_clock::now() < deadline)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      if (g_camera_capture_failed.load() ||
+          g_cameras_ready.load() != g_recording_enabled_camera_count)
+      {
+        throw std::runtime_error("failed to initialize all enabled RGB-D cameras");
+      }
+    }
+  };
 
   try
   {
-    // franka::Gripper gripper(robot_ip);
-    // gripper.homing();
-    std::cout << "gripper thread _____________________________________________________________" << std::endl;
-
-    bool grasp_flag = initially_grasped;
-    bool ever_grasped = initially_grasped;
-    enum class LeaderGripperPhase
-    {
-      kWaitForOpen,
-      kWaitForClose,
-      kCloseConsumed
-    };
-    LeaderGripperPhase leader_gripper_phase = initially_grasped
-                                                   ? LeaderGripperPhase::kCloseConsumed
-                                                   : LeaderGripperPhase::kWaitForOpen;
-    int open_sample_count = 0;
-    int close_sample_count = 0;
-    int leader_width_print_count = 0;
-    constexpr double close_threshold = 0.005;
-    constexpr double open_threshold = 0.02;
-    constexpr int required_state_samples = 5;
-
     while (running)
     {
+      double target_width = 0.08;
+      int remote_phase = kResetOrAlign;
       if (leadorfollow == "l")
       {
-        double gripper_width = gripper.readOnce().width;
+        target_width = gripper.readOnce().width;
         if (leader_width_print_count++ % 100 == 0)
         {
-          std::cout << "Gripper width is:" << gripper_width << std::endl;
+          std::cout << "Gripper width is:" << target_width << std::endl;
         }
-        // Gripper width is independent from the 1 kHz robot-state packet
-        // mutex. This prevents the gripper thread from being delayed or
-        // starved by the real-time callback and UDP sender.
-        Data2Send.gripper_width.store(gripper_width, std::memory_order_release);
-
-        if (g_stop_requested.load(std::memory_order_acquire))
+        Data2Send.gripper_width.store(target_width, std::memory_order_release);
+      }
+      else
+      {
         {
-          std::cout << "[Leader Gripper] Stop!" << std::endl;
-          break;
+          std::lock_guard<std::mutex> lock(Data2Recv.mutex);
+          target_width = Data2Recv.gripper_width;
+          remote_phase = static_cast<int>(Data2Recv.episode_phase);
+        }
+        g_follower_gripper_width.store(gripper.readOnce().width);
+      }
+
+      if (!cycle_in_progress && target_width >= open_threshold)
+      {
+        if (++open_samples >= required_state_samples)
+        {
+          close_armed = true;
+          open_samples = 0;
         }
       }
       else
       {
-        // std::atomic<double> gripper_width;
-        double target_width;
+        open_samples = 0;
+      }
+
+      if (close_armed && !cycle_in_progress && target_width < close_threshold)
+      {
+        if (++close_samples >= required_state_samples)
         {
-          std::lock_guard<std::mutex> lock(Data2Recv.mutex);
-          target_width = Data2Recv.gripper_width;
+          close_samples = 0;
+          close_armed = false;
+          cycle_in_progress = true;
+          if (leadorfollow == "f")
+          {
+            const double max_width = gripper.readOnce().max_width;
+            if (!gripper.grasp(0.0, 0.05, grasp_force, 0.0, max_width))
+            {
+              throw std::runtime_error("follower gripper failed to close for maze episode");
+            }
+            g_follower_gripper_width.store(gripper.readOnce().width);
+            prepare_episode();
+          }
+          g_episode_phase.store(kCloseDetected);
+          std::cout << "[Maze] Close confirmed; waiting for both robots, then lifting "
+                    << g_automatic_lift_m << " m."
+                    << std::endl;
         }
+      }
+      else if (target_width >= close_threshold)
+      {
+        close_samples = 0;
+      }
 
-        // record follower gripper_width
-        double current_width = gripper.readOnce().width;
-        g_follower_gripper_width.store(current_width);
+      if (leadorfollow == "f" && cycle_in_progress &&
+          g_episode_phase.load() == kLiftReady &&
+          remote_phase >= kLiftReady && !g_record_active.load())
+      {
+        g_record_start_time_ns.store(steady_time_ns());
+        g_record_started.store(true);
+        g_record_active.store(true);
+        g_episode_phase.store(kRecording);
+        std::cout << "[Recording] Started episode " << g_next_episode_index
+                  << " after both robots reached z=" << g_lift_target_z.load()
+                  << " m." << std::endl;
+      }
 
-        // Before the first successful grasp, accept only a genuine
-        // open-to-close transition from the leader. This prevents the
-        // leader's startup state or a stale UDP value from triggering
-        // repeated grasp attempts.
-        if (!ever_grasped && !grasp_flag)
+      if (cycle_in_progress && target_width >= open_threshold)
+      {
+        if (++open_samples >= required_state_samples)
         {
-          if (leader_gripper_phase == LeaderGripperPhase::kWaitForOpen)
+          open_samples = 0;
+          if (leadorfollow == "f")
           {
-            if (Data2Recv.has_received.load() && target_width >= open_threshold)
+            finish_episode(true);
+            gripper.stop();
+            const double max_width = gripper.readOnce().max_width;
+            if (!gripper.move(max_width, 0.1))
             {
-              open_sample_count++;
-              if (open_sample_count >= required_state_samples)
-              {
-                leader_gripper_phase = LeaderGripperPhase::kWaitForClose;
-                open_sample_count = 0;
-                std::cout << "[Follower Gripper] Leader open state confirmed; waiting for close."
-                          << std::endl;
-              }
+              throw std::runtime_error("follower gripper failed to open after episode");
             }
-            else
-            {
-              open_sample_count = 0;
-            }
+            g_follower_gripper_width.store(gripper.readOnce().width);
           }
-          else if (leader_gripper_phase == LeaderGripperPhase::kWaitForClose)
-          {
-            if (target_width < close_threshold)
-            {
-              close_sample_count++;
-              if (close_sample_count >= required_state_samples)
-              {
-                leader_gripper_phase = LeaderGripperPhase::kCloseConsumed;
-                close_sample_count = 0;
-                std::cout << "[Follower Gripper] Leader close action confirmed; grasping once."
-                          << std::endl;
-                movetoGrasp(gripper, target_width, grasp_flag, ever_grasped, grasp_force);
-                if (grasp_flag && start_recording_after_grasp)
-                {
-                  g_follower_gripper_width.store(gripper.readOnce().width);
-                  g_record_start_time_ns.store(steady_time_ns());
-                  g_record_started.store(true);
-                  g_record_active.store(true);
-                  std::cout << "[Recording] Started after the first successful grasp."
-                            << std::endl;
-                }
-                if (!grasp_flag)
-                {
-                  // A failed grasp command may leave the fingers partly
-                  // closed. Keep the release path armed so that a subsequent
-                  // leader-open command always reopens the follower.
-                  grasp_flag = true;
-                  ever_grasped = true;
-                  std::cerr << "[Follower Gripper] Grasp was not confirmed; release remains armed."
-                            << std::endl;
-                }
-              }
-            }
-            else
-            {
-              close_sample_count = 0;
-            }
-          }
-          else if (target_width >= open_threshold)
-          {
-            open_sample_count++;
-            if (open_sample_count >= required_state_samples)
-            {
-              leader_gripper_phase = LeaderGripperPhase::kWaitForClose;
-              open_sample_count = 0;
-              std::cout << "[Follower Gripper] Leader reopened; next close action armed."
-                        << std::endl;
-            }
-          }
-          else
-          {
-            open_sample_count = 0;
-          }
-
-          std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(10));
-          continue;
-        }
-
-        bool done = movetoGrasp(gripper, target_width, grasp_flag, ever_grasped, grasp_force);
-        if (done)
-        {
-          std::cout << "[Gripper] released, stop gripper thread." << std::endl;
-
-          //********* followr tells leader stop gripper **************
-          {
-            std::lock_guard<std::mutex> lock(Data2Send.mutex);
-            Data2Send.stop_code = 1.0;
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          // ******** follower tells leader stop gripper *************
-
-          break;
+          g_episode_phase.store(kResetOrAlign);
+          cycle_in_progress = false;
+          close_armed = true;
+          std::cout << "[Maze] Episode ended. Manually reset with leader; close again for next episode."
+                    << std::endl;
         }
       }
       std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(10));
     }
   }
-  catch (const franka::Exception &e)
+  catch (const std::exception &e)
   {
     std::cerr << "Gripper control exception:" << e.what() << std::endl;
+    running = false;
+  }
+  if (leadorfollow == "f" && episode_open)
+  {
+    finish_episode(false);
   }
 }
 
@@ -1495,7 +1523,7 @@ void rgbd_camera_thread_func(
         static_cast<size_t>(width) * height * sizeof(uint16_t);
     std::vector<uint8_t> compressed_depth(ZSTD_compressBound(raw_depth_bytes));
 
-    while (running)
+    while (running && g_camera_episode_running.load())
     {
       RealSenseRgbdFrame frame;
       if (!camera.grabRgbd(frame))
@@ -1606,7 +1634,7 @@ void udpwithremote_send(send_data &Data2send, std::atomic<bool> &running)
   servaddr.sin_addr.s_addr = inet_addr(IP_remote); // 10.162.15.208 10.162.15.234
 
   // const int NoDatatoSend = 29;
-  const int NoDatatoSend = 32;
+  const int NoDatatoSend = 33;
 
   while (running)
   {
@@ -1628,7 +1656,7 @@ void udpwithremote_send(send_data &Data2send, std::atomic<bool> &running)
           Data2send.f_local[2], Data2send.f_local[3], Data2send.f_local[4],
           Data2send.f_local[5], Data2send.energy, Data2send.stop_code,
           Data2send.gripper_width.load(std::memory_order_acquire),
-          Data2send.teleop_active};
+          Data2send.teleop_active, Data2send.episode_phase};
       send_allowed = false;
     }
 
@@ -1675,7 +1703,7 @@ void udpwithremote_recv(recv_data &Data2Recv, std::atomic<bool> &running)
   len = sizeof(cliaddr); // len is value/resuslt
 
   // const int NoDatatoRecv = 29; // 3*7+6+1+1
-  const int NoDatatoRecv = 32; // add stop_code and gripper_width, 32-- add teleop 0/1 addtorec
+  const int NoDatatoRecv = 33;
 
   double msg2recv[NoDatatoRecv];
   uint64_t recv_count = 0;
@@ -1744,6 +1772,7 @@ void udpwithremote_recv(recv_data &Data2Recv, std::atomic<bool> &running)
 
       Data2Recv.gripper_width = msg2recv[30];
       Data2Recv.teleop_active = msg2recv[31];
+      Data2Recv.episode_phase = msg2recv[32];
       Data2Recv.last_receive_time_ns.store(steady_time_ns(), std::memory_order_release);
       Data2Recv.has_received.store(true);
 
@@ -1764,6 +1793,7 @@ void udpwithremote_recv(recv_data &Data2Recv, std::atomic<bool> &running)
                   << " dq_norm=" << std::sqrt(dq_norm)
                   << " grip=" << Data2Recv.gripper_width
                   << " teleop_active=" << Data2Recv.teleop_active
+                  << " episode_phase=" << Data2Recv.episode_phase
                   << " stop=" << Data2Recv.stop_code
                   << std::endl;
       }
