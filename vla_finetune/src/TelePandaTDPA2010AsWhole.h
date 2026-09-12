@@ -130,7 +130,7 @@ bool movetoGrasp(franka::Gripper &gripper, double target_width,
 
 void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool> &running, franka::Gripper &gripper,
                    const std::string &leadorfollow, bool initially_grasped,
-                   double grasp_force);
+                   double grasp_force, bool start_recording_after_grasp);
 
 //void check_wiggle_info(wiggle_para & w_para, json parameter);
 

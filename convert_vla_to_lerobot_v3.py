@@ -11,8 +11,8 @@ Example:
         vla_finetune/data/Threading_20260826_120000 \
         data/threading_vla_lerobot_v3
 
-Default camera mapping is ``cam1.mp4`` = side view, ``cam2.mp4`` = wrist, and
-``cam3.mp4`` = front view.
+Default camera mapping is ``cam1.mp4`` = side view and ``cam3.mp4`` = front
+view. The optional ``cam2.mp4`` wrist view can be supplied with ``--camera``.
 Use repeated ``--camera RAW_FILE=FEATURE`` arguments if a deployment uses the
 opposite numbering.
 """
@@ -35,7 +35,6 @@ TIMESTAMPED_ROBOT_COLUMNS = 30
 STATE_NAMES = [f"q{i}" for i in range(1, 8)] + ["gripper_width"]
 DEFAULT_CAMERAS = (
     ("cam1.mp4", "observation.images.exterior_image_2_right"),
-    ("cam2.mp4", "observation.images.wrist_image_left"),
     ("cam3.mp4", "observation.images.exterior_image_1_left"),
 )
 
@@ -641,7 +640,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         type=parse_camera,
         metavar="RAW_FILE=FEATURE",
-        help="repeat for each camera; defaults to cam1=sideview, cam2=wrist, cam3=frontview",
+        help="repeat for each camera; defaults to cam1=sideview and cam3=frontview",
     )
     parser.add_argument(
         "--active-only",

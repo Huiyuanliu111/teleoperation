@@ -22,7 +22,7 @@ from convert_vla_to_lerobot_v3 import (
 )
 
 
-CAMERAS = ("cam1.mp4", "cam2.mp4", "cam3.mp4")
+LEGACY_CAMERAS = ("cam1", "cam2", "cam3")
 
 
 def video_frame_count(path: Path) -> int:
@@ -49,6 +49,10 @@ def validate_episode(
         raise ValueError(f"{trial}: unsupported recording manifest format")
     if manifest.get("role") not in (None, "follower"):
         raise ValueError(f"{trial}: recording manifest is not from the follower")
+    camera_names = tuple(manifest.get("recorded_cameras", LEGACY_CAMERAS))
+    if not camera_names or any(name not in LEGACY_CAMERAS for name in camera_names):
+        raise ValueError(f"{trial}: invalid recorded_cameras {camera_names}")
+    cameras = tuple(f"{name}.mp4" for name in camera_names)
     matrix = read_follower_matrix(trial / "DATA_follower.m")
     if matrix.shape[1] != TIMESTAMPED_ROBOT_COLUMNS or follower_column_offset(matrix) != 1:
         raise ValueError(f"{trial}: expected timestamped 30-column follower data")
@@ -56,11 +60,11 @@ def validate_episode(
     if np.any(np.diff(robot_timestamps) <= 0):
         raise ValueError(f"{trial}: robot host timestamps are not strictly increasing")
 
-    counts = [video_frame_count(trial / filename) for filename in CAMERAS]
+    counts = [video_frame_count(trial / filename) for filename in cameras]
     camera_timestamps = []
     depth_frames = []
     serials = []
-    for filename, count in zip(CAMERAS, counts, strict=True):
+    for filename, count in zip(cameras, counts, strict=True):
         stem = Path(filename).stem
         timestamps = read_camera_timestamp_csv(
             trial / f"{stem}_timestamps.csv", count
@@ -76,27 +80,27 @@ def validate_episode(
         close_depth_source(depth)
 
     manifest_serials = manifest.get("camera_serials", {})
-    for index, serial in enumerate(serials, start=1):
-        expected = manifest_serials.get(f"cam{index}")
+    for camera_name, serial in zip(camera_names, serials, strict=True):
+        expected = manifest_serials.get(camera_name)
         if expected is not None and str(expected) != serial:
             raise ValueError(
-                f"{trial}: cam{index} metadata serial {serial} does not match "
+                f"{trial}: {camera_name} metadata serial {serial} does not match "
                 f"manifest serial {expected}"
             )
     manifest_counts = manifest.get("committed_camera_frames", {})
     if manifest.get("complete", False):
-        for index, (video_count, timestamp_count, depth_count) in enumerate(
-            zip(counts, map(len, camera_timestamps), depth_frames, strict=True), start=1
+        for camera_name, video_count, timestamp_count, depth_count in zip(
+            camera_names, counts, map(len, camera_timestamps), depth_frames, strict=True
         ):
-            expected = manifest_counts.get(f"cam{index}")
+            expected = manifest_counts.get(camera_name)
             if expected is not None and int(expected) != timestamp_count:
                 raise ValueError(
-                    f"{trial}: cam{index} manifest commits {expected} frames but "
+                    f"{trial}: {camera_name} manifest commits {expected} frames but "
                     f"timestamp CSV commits {timestamp_count}"
                 )
             if video_count != timestamp_count or depth_count != timestamp_count:
                 raise ValueError(
-                    f"{trial}: complete cam{index} stream has video/timestamp/depth "
+                    f"{trial}: complete {camera_name} stream has video/timestamp/depth "
                     f"counts {video_count}/{timestamp_count}/{depth_count}"
                 )
 
@@ -117,6 +121,7 @@ def validate_episode(
         "committed_camera_frames": [int(len(item)) for item in camera_timestamps],
         "complete_depth_frames": depth_frames,
         "camera_serials": serials,
+        "camera_names": camera_names,
         "aligned_frames": int(len(robot_rows)),
         "reference_frames": reference_count,
         "retained_fraction": float(len(robot_rows) / reference_count),

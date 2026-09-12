@@ -53,17 +53,27 @@ Follower data and camera recording are enabled for collection:
 ```json
 "record_data": true,
 "record_camera": true,
+"recording_start": "first_grasp",
 "camera_serials": {
   "cam1": "233722072293",
   "cam2": "233622071984",
   "cam3": "233522077069"
+},
+"camera_enabled": {
+  "cam1": true,
+  "cam2": false,
+  "cam3": true
 },
 "gripper_grasp_force": 70.0
 ```
 
 Only the follower writes the recorded files. `gripper_grasp_force` controls the
 follower grasp force in newtons and must be greater than `0` and no more than
-`70`.
+`70`. With `recording_start` set to `first_grasp`, the cameras and robot-state
+recorder are armed at startup but do not write the homing, approach, or grasp
+segments. Recording begins only after the follower confirms the first successful
+grasp, so the saved episode contains the threading segment. Use `immediate` for
+tasks that need the full approach-and-grasp trajectory.
 
 ## Controller PC Requirements
 
@@ -191,10 +201,6 @@ vla_finetune/data/<trial_name>/episode_001/
   cam1_depth.z16.zst
   cam1_timestamps.csv
   cam1_metadata.json
-  cam2.mp4
-  cam2_depth.z16.zst
-  cam2_timestamps.csv
-  cam2_metadata.json
   cam3.mp4
   cam3_depth.z16.zst
   cam3_timestamps.csv
@@ -202,9 +208,11 @@ vla_finetune/data/<trial_name>/episode_001/
 ```
 
 The camera mapping is `cam1=sideview`, `cam2=wrist`, and `cam3=frontview`.
-The three serial numbers are configured in `follower_config.json`. Verify the
-mapping physically on the follower before collection; enumeration alone cannot
-tell which viewpoint a camera occupies:
+The current Threading configuration disables `cam2`, so only the side and front
+views are connected and recorded. Camera serial numbers and enabled states are
+configured in `follower_config.json`. Verify the mapping physically on the
+follower before collection; enumeration alone cannot tell which viewpoint a
+camera occupies:
 
 ```bash
 cd ~/teleoperation/vla_finetune/build
@@ -225,9 +233,10 @@ same `std::chrono::steady_clock` nanosecond clock. RealSense sensor timestamps
 and frame numbers are retained as additional diagnostics. Legacy uncompressed
 `camN_depth.z16` episodes remain supported.
 
-Raw three-camera depth would be about 55 MB/s. On the two smoke episodes, Zstd
-reduced one representative depth stream from 407 MB to about 61 MB; the exact
-ratio depends on the scene. Record to the follower's local SSD. Do not run
+The current two-camera configuration avoids the wrist stream's recording and
+compression overhead. On the earlier smoke episodes, Zstd reduced one
+representative depth stream from 407 MB to about 61 MB; the exact ratio depends
+on the scene. Record to the follower's local SSD. Do not run
 `trim_invisible_prefix.py` on RGB-D recordings; filter timestamped episodes
 during conversion instead.
 
@@ -272,6 +281,7 @@ Follower:
 [Follower Gripper] Homed. Current width ... m; initial grasp skipped.
 Finished moving to initial joint configuration.
 TDPA initialize done
+[Recording] Armed; waiting for the first successful grasp.
 ```
 
 Leader:
@@ -287,6 +297,10 @@ After startup, the follower ignores closed or stale initial values. It first
 confirms that the leader gripper is open, then treats a confirmed open-to-close
 transition as one grasp command. A failed grasp is attempted only once; the
 leader must reopen and close again before another attempt.
+
+For the Threading configuration, a successful first grasp prints
+`[Recording] Started after the first successful grasp.` and opens the shared
+robot/RGB-D recording gate. Frames captured before that point are discarded.
 
 Both sides should also print UDP receive diagnostics:
 
@@ -318,7 +332,7 @@ camera frame and the nearest robot row. Conversion uses the same limits:
 ```bash
 conda run -n pushbox python convert_vla_to_lerobot_v3.py \
   vla_finetune/data/<trial_name> data/<dataset_name> \
-  --repo-id local/<dataset_name> --task "pick up and insert the block" \
+  --repo-id local/<dataset_name> --task "insert the grasped block through the needle" \
   --image-size 224
 ```
 
@@ -348,11 +362,10 @@ stride-5 state. The default base-frame crop is
 `[0.15, -0.40, -0.15]` to `[0.75, 0.30, 0.50]` metres and can be changed with
 `--bounds XMIN YMIN ZMIN XMAX YMAX ZMAX` after inspecting a trial.
 
-Only `sideview` and `frontview` are fused because their base extrinsics are
-already calibrated. The wrist RGB-D stream is retained in the raw data, but it
-requires a separate hand-eye calibration before it can be transformed into the
-base frame. This restriction prevents geometrically incorrect three-camera
-fusion while preserving everything needed to add the wrist view later.
+Only `sideview` and `frontview` are recorded and fused because their base
+extrinsics are already calibrated. The wrist camera is disabled and would
+require a separate hand-eye calibration before its depth could be transformed
+into the base frame.
 
 On the follower, packets should come from `10.157.175.16`. On the leader,
 packets should come from `10.157.175.22`.

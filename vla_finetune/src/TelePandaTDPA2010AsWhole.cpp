@@ -12,6 +12,8 @@ static inline std::string format_episode_dir(int episode_idx)
 }
 
 std::atomic<bool> g_record_active{false};
+std::atomic<bool> g_record_started{false};
+std::atomic<int64_t> g_record_start_time_ns{0};
 std::atomic<bool> g_stop_requested{false};
 std::atomic<double> g_follower_gripper_width{0.0};
 std::atomic<int> g_cameras_ready{0};
@@ -123,8 +125,19 @@ int main(int argc, char **argv)
   bool tau_ext_feedback = parameter["tau_ext_feedback"];
   bool record_data = parameter.value("record_data", false);
   bool record_camera = parameter.value("record_camera", false);
+  const std::string recording_start =
+      parameter.value("recording_start", std::string("immediate"));
+  if (recording_start != "immediate" && recording_start != "first_grasp")
+  {
+    std::cerr << "recording_start must be either 'immediate' or 'first_grasp'"
+              << std::endl;
+    return -1;
+  }
+  const bool start_recording_after_grasp =
+      leadorfollow == "f" && recording_start == "first_grasp";
   std::array<std::string, 3> camera_serials = {
       "233722072293", "233622071984", "233522077069"};
+  std::array<bool, 3> camera_enabled = {true, true, true};
   if (parameter.contains("camera_serials"))
   {
     const auto &configured_serials = parameter.at("camera_serials");
@@ -132,6 +145,22 @@ int main(int argc, char **argv)
         configured_serials.at("cam1").get<std::string>(),
         configured_serials.at("cam2").get<std::string>(),
         configured_serials.at("cam3").get<std::string>()};
+  }
+  if (parameter.contains("camera_enabled"))
+  {
+    const auto &configured_cameras = parameter.at("camera_enabled");
+    camera_enabled = {
+        configured_cameras.value("cam1", true),
+        configured_cameras.value("cam2", true),
+        configured_cameras.value("cam3", true)};
+  }
+  const int enabled_camera_count = static_cast<int>(
+      std::count(camera_enabled.begin(), camera_enabled.end(), true));
+  if (record_camera && enabled_camera_count == 0)
+  {
+    std::cerr << "record_camera=true requires at least one enabled camera"
+              << std::endl;
+    return -1;
   }
   if (camera_serials[0] == camera_serials[1] ||
       camera_serials[0] == camera_serials[2] ||
@@ -146,7 +175,6 @@ int main(int argc, char **argv)
     std::cerr << "gripper_grasp_force must be in the range (0, 70] N" << std::endl;
     return -1;
   }
-
   double gain_tau_ld;
   double gain_dq_l;
   double gain_tau_f;
@@ -252,6 +280,9 @@ int main(int argc, char **argv)
   Data2Send.stop_code = 0.0;
   Data2Recv.stop_code = 0.0;
   g_stop_requested.store(false);
+  g_record_active.store(false);
+  g_record_started.store(false);
+  g_record_start_time_ns.store(0);
 
   std::thread t_send;
   std::thread t_recv;
@@ -347,7 +378,8 @@ int main(int argc, char **argv)
 
     t_gripper = std::thread(gripperControl, std::ref(Data2Send), std::ref(Data2Recv),
                             std::ref(running), std::ref(*gripper_ptr), leadorfollow,
-                            follower_initially_grasped, gripper_grasp_force);
+                            follower_initially_grasped, gripper_grasp_force,
+                            start_recording_after_grasp);
 
     // Load the kinematics and dynamics model.
     franka::Model model = robot.loadModel();
@@ -425,6 +457,12 @@ int main(int argc, char **argv)
       for (int camera_index = 0; camera_index < 3; ++camera_index)
       {
         g_camera_committed_frames[camera_index].store(0);
+        if (!camera_enabled[camera_index])
+        {
+          std::cout << "[RGB-D cam" << camera_index + 1
+                    << "] disabled by configuration." << std::endl;
+          continue;
+        }
         t_cameras[camera_index] = std::thread(
             rgbd_camera_thread_func, camera_index + 1, std::ref(running),
             trial_dir.string(), camera_serials[camera_index],
@@ -433,23 +471,34 @@ int main(int argc, char **argv)
       }
       const auto camera_deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(15);
-      while (g_cameras_ready.load() < 3 &&
+      while (g_cameras_ready.load() < enabled_camera_count &&
              !g_camera_capture_failed.load() &&
              std::chrono::steady_clock::now() < camera_deadline)
       {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
       }
-      if (g_camera_capture_failed.load() || g_cameras_ready.load() != 3)
+      if (g_camera_capture_failed.load() ||
+          g_cameras_ready.load() != enabled_camera_count)
       {
         running = false;
-        throw std::runtime_error("failed to initialize all three RGB-D cameras");
+        throw std::runtime_error("failed to initialize all enabled RGB-D cameras");
       }
     }
     //************************************************************************************************
 
-    // ===start recording====================================================================
-    g_record_active.store(record_data || record_camera);
-    //=======================================================================================
+    // Start immediately for legacy tasks, or wait until the follower has
+    // confirmed its first grasp so Threading recordings contain insertion only.
+    if ((record_data || record_camera) && !start_recording_after_grasp)
+    {
+      g_record_start_time_ns.store(steady_time_ns());
+      g_record_started.store(true);
+      g_record_active.store(true);
+    }
+    else if (record_data || record_camera)
+    {
+      std::cout << "[Recording] Armed; waiting for the first successful grasp."
+                << std::endl;
+    }
 
     ////////////////////// Define callback for the joint torque control
     /// loop.//////////////////////////////////////////////////////////////////////
@@ -748,12 +797,7 @@ int main(int argc, char **argv)
       {
         for (size_t i = 0; i < 7; i++)
         {
-          // if (!TDPA_active)
-          // tau_d_calculated[i] = 0.8 * k_gains[i] * (q_des[i] - state.q[i]) +
-          //                       0.5 * d_gains[i] * (dq_remote[i] - dq_local[i]) + 0 * dq_local[i] +
-          //                       coriolis[i];
-          // else
-          tau_d_calculated[i] = 1.0 * tau_c[i]; // + gamma * jacobian.transpose() * f_ff;
+          tau_d_calculated[i] = 1.0 * tau_c[i];
         }
       }
 
@@ -1009,29 +1053,48 @@ int main(int argc, char **argv)
       if (record_camera)
       {
         camera_data_complete = !g_camera_capture_failed.load();
-        for (const auto &frame_count : g_camera_committed_frames)
+        for (size_t camera_index = 0; camera_index < camera_enabled.size(); ++camera_index)
         {
-          camera_data_complete = camera_data_complete && frame_count.load() > 0;
+          if (camera_enabled[camera_index])
+          {
+            camera_data_complete = camera_data_complete &&
+                                   g_camera_committed_frames[camera_index].load() > 0;
+          }
         }
+      }
+      json recorded_cameras = json::array();
+      json recorded_camera_serials = json::object();
+      json committed_camera_frames = json::object();
+      for (size_t camera_index = 0; camera_index < camera_enabled.size(); ++camera_index)
+      {
+        if (!camera_enabled[camera_index])
+        {
+          continue;
+        }
+        const std::string camera_name = "cam" + std::to_string(camera_index + 1);
+        recorded_cameras.push_back(camera_name);
+        recorded_camera_serials[camera_name] = camera_serials[camera_index];
+        committed_camera_frames[camera_name] =
+            g_camera_committed_frames[camera_index].load();
       }
       json manifest = {
           {"format", "threading-rgbd-recording-v2"},
-          {"complete", exit_code == 0 && robot_data_complete && camera_data_complete},
+          {"complete", exit_code == 0 && g_record_started.load() &&
+                           robot_data_complete && camera_data_complete},
           {"role", "follower"},
           {"record_data", record_data},
           {"record_camera", record_camera},
+          {"recording_start", recording_start},
+          {"recording_started", g_record_started.load()},
+          {"recording_start_host_steady_timestamp_ns",
+           g_record_start_time_ns.load()},
           {"robot_columns", NoDataRec},
           {"robot_timestamp_column", "host_steady_timestamp_ns"},
           {"camera_timestamp_clock", "host_steady_timestamp_ns"},
           {"depth_encoding", "uint16_z16_aligned_to_color"},
-          {"camera_serials",
-           {{"cam1", camera_serials[0]},
-            {"cam2", camera_serials[1]},
-            {"cam3", camera_serials[2]}}},
-          {"committed_camera_frames",
-           {{"cam1", g_camera_committed_frames[0].load()},
-            {"cam2", g_camera_committed_frames[1].load()},
-            {"cam3", g_camera_committed_frames[2].load()}}}};
+          {"recorded_cameras", recorded_cameras},
+          {"camera_serials", recorded_camera_serials},
+          {"committed_camera_frames", committed_camera_frames}};
       const fs::path temporary = trial_dir / "recording_manifest.json.tmp";
       const fs::path final_path = trial_dir / "recording_manifest.json";
       std::ofstream stream(temporary);
@@ -1045,7 +1108,7 @@ int main(int argc, char **argv)
 
 void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool> &running, franka::Gripper &gripper,
                     const std::string &leadorfollow, bool initially_grasped,
-                    double grasp_force)
+                    double grasp_force, bool start_recording_after_grasp)
 {
 
   try
@@ -1141,6 +1204,15 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool
                 std::cout << "[Follower Gripper] Leader close action confirmed; grasping once."
                           << std::endl;
                 movetoGrasp(gripper, target_width, grasp_flag, ever_grasped, grasp_force);
+                if (grasp_flag && start_recording_after_grasp)
+                {
+                  g_follower_gripper_width.store(gripper.readOnce().width);
+                  g_record_start_time_ns.store(steady_time_ns());
+                  g_record_started.store(true);
+                  g_record_active.store(true);
+                  std::cout << "[Recording] Started after the first successful grasp."
+                            << std::endl;
+                }
                 if (!grasp_flag)
                 {
                   // A failed grasp command may leave the fingers partly
@@ -1374,6 +1446,10 @@ void rgbd_camera_thread_func(
         throw std::runtime_error("lost RGB-D frame from camera " + camera_serial);
       }
       if (!g_record_active.load())
+      {
+        continue;
+      }
+      if (frame.host_timestamp_ns < g_record_start_time_ns.load())
       {
         continue;
       }
