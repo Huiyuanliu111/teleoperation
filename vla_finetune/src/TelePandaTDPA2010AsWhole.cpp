@@ -4,6 +4,11 @@
 
 namespace fs = std::filesystem;
 
+// panda_link8 -> panda_hand_tcp. Together with the 0.107 m link7 -> link8
+// offset in Kinematics.h, this matches the panda_hand_tcp frame used by the
+// maze dataset and deployment URDF.
+constexpr double kPandaHandTcpOffsetM = 0.1034;
+
 static inline std::string format_episode_dir(int episode_idx)
 {
   char buf[32];
@@ -175,6 +180,21 @@ int main(int argc, char **argv)
     std::cerr << "gripper_grasp_force must be in the range (0, 70] N" << std::endl;
     return -1;
   }
+  const bool lock_tcp_z = leadorfollow == "f" &&
+                          parameter.value("lock_tcp_z", false);
+  const double tcp_z_stiffness =
+      parameter.value("tcp_z_stiffness", 1000.0);
+  const double tcp_z_damping = parameter.value(
+      "tcp_z_damping", 2.0 * std::sqrt(tcp_z_stiffness));
+  if (lock_tcp_z && (tcp_z_stiffness <= 0.0 || tcp_z_damping < 0.0 ||
+                     !std::isfinite(tcp_z_stiffness) ||
+                     !std::isfinite(tcp_z_damping)))
+  {
+    std::cerr << "tcp_z_stiffness must be positive and tcp_z_damping must "
+                 "be non-negative"
+              << std::endl;
+    return -1;
+  }
   double gain_tau_ld;
   double gain_dq_l;
   double gain_tau_f;
@@ -290,6 +310,7 @@ int main(int argc, char **argv)
   std::thread t_gripper;
   int exit_code = 0;
   bool control_diagnostics_valid = false;
+  double fixed_tcp_z = std::numeric_limits<double>::quiet_NaN();
   std::array<double, 7> last_q_measured = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> last_q_desired = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> last_q_remote_delta = {{0, 0, 0, 0, 0, 0, 0}};
@@ -385,6 +406,15 @@ int main(int argc, char **argv)
     franka::Model model = robot.loadModel();
 
     initial_state = robot.readOnce();
+    if (lock_tcp_z)
+    {
+      const Eigen::Matrix4d collection_start_pose =
+          Kinematics::ForwardKinematics(initial_state.q.data(),
+                                        kPandaHandTcpOffsetM);
+      fixed_tcp_z = collection_start_pose(2, 3);
+      std::cout << "[Maze] Locked TCP z for this collection: " << fixed_tcp_z
+                << " m" << std::endl;
+    }
     // Bias torque sensor
     std::cout << "q=" << initial_state.q << std::endl;
     std::cout << std::endl;
@@ -795,9 +825,33 @@ int main(int argc, char **argv)
       }
       else if (leadorfollow == "f")
       {
-        for (size_t i = 0; i < 7; i++)
+        if (lock_tcp_z)
         {
-          tau_d_calculated[i] = 1.0 * tau_c[i];
+          // Give the planar z task priority over the leader's joint-space
+          // motion. Remove the direct z component of the joint tracking
+          // torque, then add a Cartesian spring-damper at the TCP height read
+          // immediately before this collection starts.
+          const Eigen::Matrix<double, 6, 7> tcp_jacobian =
+              Kinematics::ComputeJacobian(state.q.data(),
+                                          kPandaHandTcpOffsetM);
+          const Eigen::Matrix<double, 1, 7> z_jacobian = tcp_jacobian.row(2);
+          const Eigen::Matrix4d tcp_pose =
+              Kinematics::ForwardKinematics(state.q.data(),
+                                            kPandaHandTcpOffsetM);
+          const double denominator = z_jacobian.squaredNorm() + 1e-9;
+          Eigen::Map<const Eigen::Matrix<double, 7, 1>> joint_torque(tau_c.data());
+          Eigen::Matrix<double, 7, 1> constrained_torque = joint_torque;
+          constrained_torque -= z_jacobian.transpose() *
+                                ((z_jacobian * joint_torque)(0) / denominator);
+          const double z_velocity = (z_jacobian * dq_eig)(0);
+          const double z_force = tcp_z_stiffness * (fixed_tcp_z - tcp_pose(2, 3)) -
+                                 tcp_z_damping * z_velocity;
+          constrained_torque += z_jacobian.transpose() * z_force;
+          Eigen::VectorXd::Map(tau_d_calculated.data(), 7) = constrained_torque;
+        }
+        else
+        {
+          tau_d_calculated = tau_c;
         }
       }
 
@@ -1088,6 +1142,9 @@ int main(int argc, char **argv)
           {"recording_started", g_record_started.load()},
           {"recording_start_host_steady_timestamp_ns",
            g_record_start_time_ns.load()},
+          {"lock_tcp_z", lock_tcp_z},
+          {"fixed_tcp_z_m", lock_tcp_z ? json(fixed_tcp_z) : json(nullptr)},
+          {"fixed_tcp_frame", lock_tcp_z ? json("panda_hand_tcp") : json(nullptr)},
           {"robot_columns", NoDataRec},
           {"robot_timestamp_column", "host_steady_timestamp_ns"},
           {"camera_timestamp_clock", "host_steady_timestamp_ns"},

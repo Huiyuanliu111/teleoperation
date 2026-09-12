@@ -5,7 +5,7 @@ typedef Matrix<double, 9, 1> Vector9d;
 
 namespace Kinematics {
 
-Matrix4d ForwardKinematics(double *q) {
+Matrix4d ForwardKinematics(const double *q, double tool_length = 0.173) {
     // Vector7d q
 
     Matrix4d Ab0, A01, A12, A23, A34, A45, A56, A67, A7f, Afr;
@@ -17,7 +17,7 @@ Matrix4d ForwardKinematics(double *q) {
     double C1, S1, C2, S2, C3, S3, C4, S4, C5, S5, C6, S6, C7, S7;
     double d1{0.333}, d3{0.316}, d5{0.384}, df{0.107};
     double a3{0.0825}, a4{-0.0825}, a6{0.088};
-    double l(0.173);  // tool length
+    double l(tool_length);  // tool length after panda_link8
 
     C1 = cos(q[0]);
     S1 = sin(q[0]);
@@ -83,7 +83,7 @@ Matrix4d ForwardKinematics(double *q) {
 }
 
 //**************************************************************************************
-Matrix<double, 6, 7> ComputeJacobian(double *q) {
+Matrix<double, 6, 7> ComputeJacobian(const double *q, double tool_length = 0.173) {
     Matrix<double, 6, 7> Jacobian;
     Jacobian.setZero();
 
@@ -97,7 +97,7 @@ Matrix<double, 6, 7> ComputeJacobian(double *q) {
     double C1, S1, C2, S2, C3, S3, C4, S4, C5, S5, C6, S6, C7, S7;
     double d1{0.333}, d3{0.316}, d5{0.384}, df{0.107};
     double a3{0.0825}, a4{-0.0825}, a6{0.088};
-    double l(0.173);  // tool length
+    double l(tool_length);  // tool length after panda_link8
 
     C1 = cos(q[0]);
     S1 = sin(q[0]);

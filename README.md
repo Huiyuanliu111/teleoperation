@@ -75,6 +75,13 @@ segments. Recording begins only after the follower confirms the first successful
 grasp, so the saved episode contains the threading segment. Use `immediate` for
 tasks that need the full approach-and-grasp trajectory.
 
+On the `maze_data` branch, the follower configuration also enables
+`lock_tcp_z`. After the initial joint move, the collector reads the current
+`panda_hand_tcp` z once and holds that height for the entire collection. The
+captured value is printed as `[Maze] Locked TCP z ...` and written to
+`recording_manifest.json` as `fixed_tcp_z_m`; no fixed numeric z is stored in
+the configuration.
+
 ## Controller PC Requirements
 
 Install the required packages on both controller PCs:

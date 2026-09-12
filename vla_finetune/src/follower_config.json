@@ -20,6 +20,9 @@
         "cam3": true
     },
     "gripper_grasp_force": 70.0,
+    "lock_tcp_z": true,
+    "tcp_z_stiffness": 1000.0,
+    "tcp_z_damping": 63.2455532,
     "TDPA_active": false,
     "tau_ext_feedback": true,
     "k_pos_drift": 0.0,

@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <cstdio>
 #include <memory>
+#include <limits>
 #include <future>
 #include <stdexcept>
 #include <vector>
