@@ -1412,11 +1412,23 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool
           if (leadorfollow == "f")
           {
             const double max_width = gripper.readOnce().max_width;
-            if (!gripper.grasp(0.0, 0.05, grasp_force, 0.0, max_width))
+            const bool grasp_confirmed =
+                gripper.grasp(0.0, 0.05, grasp_force, 0.0, max_width);
+            const franka::GripperState grasp_state = gripper.readOnce();
+            g_follower_gripper_width.store(grasp_state.width);
+            if (!grasp_confirmed)
             {
-              throw std::runtime_error("follower gripper failed to close for maze episode");
+              // libfranka returns false when its internal grasp predicate is
+              // not satisfied, even though the fingers have closed and may be
+              // holding the object. The leader's close transition defines the
+              // episode boundary, so preserve the actual gripper state and
+              // continue into the synchronized lift.
+              std::cerr << "[Follower Gripper] Close command completed without "
+                           "libfranka grasp confirmation; continuing with width="
+                        << grasp_state.width
+                        << " m, is_grasped=" << grasp_state.is_grasped << "."
+                        << std::endl;
             }
-            g_follower_gripper_width.store(gripper.readOnce().width);
             prepare_episode();
           }
           g_episode_phase.store(kCloseDetected);
