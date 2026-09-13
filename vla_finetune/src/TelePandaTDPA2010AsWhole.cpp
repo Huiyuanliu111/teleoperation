@@ -1483,14 +1483,21 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool
                   << " m." << std::endl;
       }
 
-      if (cycle_in_progress && target_width >= open_threshold)
+      const bool release_requested =
+          target_width >= open_threshold ||
+          (leadorfollow == "f" && remote_phase == kResetOrAlign);
+      if (cycle_in_progress && release_requested)
       {
         if (++open_samples >= required_state_samples)
         {
           open_samples = 0;
+          // End the episode and release the z constraint immediately. The
+          // camera/recorder flush can take much longer than opening the hand,
+          // so it must not delay the follower's physical release.
+          g_record_active.store(false);
+          g_episode_phase.store(kResetOrAlign);
           if (leadorfollow == "f")
           {
-            finish_episode(true);
             gripper.stop();
             const double max_width = gripper.readOnce().max_width;
             if (!gripper.move(max_width, 0.1))
@@ -1498,8 +1505,10 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool
               throw std::runtime_error("follower gripper failed to open after episode");
             }
             g_follower_gripper_width.store(gripper.readOnce().width);
+            std::cout << "[Follower Gripper] Released on leader open command."
+                      << std::endl;
+            finish_episode(true);
           }
-          g_episode_phase.store(kResetOrAlign);
           cycle_in_progress = false;
           close_armed = true;
           std::cout << "[Maze] Episode ended. Manually reset with leader; close again for next episode."
