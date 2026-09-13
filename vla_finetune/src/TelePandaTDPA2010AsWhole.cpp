@@ -1389,17 +1389,20 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool
         g_follower_gripper_width.store(gripper.readOnce().width);
       }
 
-      if (!cycle_in_progress && target_width >= open_threshold)
+      if (!cycle_in_progress)
       {
-        if (++open_samples >= required_state_samples)
+        if (target_width >= open_threshold)
         {
-          close_armed = true;
+          if (++open_samples >= required_state_samples)
+          {
+            close_armed = true;
+            open_samples = 0;
+          }
+        }
+        else
+        {
           open_samples = 0;
         }
-      }
-      else
-      {
-        open_samples = 0;
       }
 
       if (close_armed && !cycle_in_progress && target_width < close_threshold)
