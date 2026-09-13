@@ -132,17 +132,27 @@ int main(int argc, char **argv)
 
   /* Read and parse JSON file parameters */
   // json parameter;
-  std::ifstream parameter_file;
-  if (leadorfollow == "l")
+  const fs::path parameter_path =
+      project_dir / "src" /
+      (leadorfollow == "l" ? "leader_config.json" : "follower_config.json");
+  std::ifstream parameter_file(parameter_path);
+  if (!parameter_file)
   {
-    parameter_file.open("../src/leader_config.json");
+    std::cerr << "failed to open configuration file: " << parameter_path
+              << std::endl;
+    return -1;
   }
-  else
+  json parameter;
+  try
   {
-    parameter_file.open("../src/follower_config.json");
+    parameter_file >> parameter;
   }
-
-  json parameter = json::parse(parameter_file);
+  catch (const json::parse_error &error)
+  {
+    std::cerr << "failed to parse configuration file " << parameter_path
+              << ": " << error.what() << std::endl;
+    return -1;
+  }
 
   std::string IP_remote_st = parameter["remote_ip"];
   IP_remote = IP_remote_st.c_str();
