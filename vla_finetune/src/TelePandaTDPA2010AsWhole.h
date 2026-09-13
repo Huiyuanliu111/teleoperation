@@ -91,6 +91,7 @@ struct send_data
   std::mutex mutex;
   double pandatime = 0;
   std::array<double, 7> q_local_delta{0, 0, 0, 0, 0, 0, 0};
+  std::array<double, 7> q_local_absolute{0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> dq_local = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> tau_local = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 6> f_local = {{0, 0, 0, 0, 0, 0}};
@@ -99,6 +100,7 @@ struct send_data
   std::atomic<double> gripper_width{0.08};
   double teleop_active = 0.0;
   double episode_phase = 0.0;
+  double robot_state_valid = 0.0;
 };
 
 struct recv_data
@@ -108,6 +110,7 @@ struct recv_data
   std::atomic<int64_t> last_receive_time_ns{0};
   double remotetime = 0;
   std::array<double, 7> q_remote_delta = {{0, 0, 0, 0, 0, 0, 0}};
+  std::array<double, 7> q_remote_absolute = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 7> dq_remote = {0, 0, 0, 0, 0, 0, 0};
   std::array<double, 7> tau_remote = {{0, 0, 0, 0, 0, 0, 0}};
   std::array<double, 6> f_remote = {{0, 0, 0, 0, 0, 0}};
@@ -116,6 +119,7 @@ struct recv_data
   double gripper_width = 0.08;
   double teleop_active = 0.0;
   double episode_phase = 0.0;
+  double robot_state_valid = 0.0;
 };
 
 

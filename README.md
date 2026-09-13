@@ -55,6 +55,7 @@ Follower data and camera recording are enabled for collection:
 "record_camera": true,
 "maze_cycle": true,
 "automatic_lift_m": 0.02,
+"leader_initialization_speed_factor": 0.05,
 "lift_tolerance_m": 0.001,
 "lift_velocity_tolerance_mps": 0.005,
 "lift_hold_cycles": 200,
@@ -73,12 +74,13 @@ Follower data and camera recording are enabled for collection:
 
 Only the follower writes recorded files. `gripper_grasp_force` controls its
 grasp force in newtons and must be greater than `0` and no more than `70`.
-With `maze_cycle` enabled, neither robot performs an automatic joint reset.
-The operator aligns the leader with the stationary follower before the first
-episode. Closing the leader gripper closes the follower gripper, establishes a
-fresh motion baseline, and makes both robots rise 2 cm. Recording starts only
-after both TCPs have settled at their new heights. That follower TCP z is held
-for the episode and saved as `fixed_tcp_z_m`.
+With `maze_cycle` enabled, the follower publishes its current seven-joint pose
+at startup and holds that pose. The leader reads it over UDP and automatically
+moves to the same joint pose at the configured speed factor. Closing the leader
+gripper then closes the follower gripper, establishes a fresh motion baseline,
+and makes both robots rise 2 cm. Recording starts only after both TCPs have
+settled at their new heights. That follower TCP z is held for the episode and
+saved as `fixed_tcp_z_m`.
 
 ## Controller PC Requirements
 
@@ -283,7 +285,7 @@ Follower:
 ```text
 [Gripper Init] Homing succeeded.
 [Follower Gripper] Homed. Current width ... m; initial grasp skipped.
-[Maze] No automatic joint reset. Align the leader with the follower manually, then close the leader gripper.
+[Maze Init] Holding the current follower pose while the leader initializes.
 TDPA initialize done
 [Recording] Waiting for leader gripper close.
 ```
@@ -293,7 +295,9 @@ Leader:
 ```text
 [Gripper Init] Homing succeeded.
 [Leader Gripper] Homed and left open at width ... m.
-[Maze] No automatic joint reset. Align the leader with the follower manually, then close the leader gripper.
+[Maze Init] Waiting for the follower's current joint pose.
+[Maze Init] Moving leader to follower q=[...]
+[Maze Init] Leader reached the follower pose. Close the leader gripper to start the first lift.
 TDPA initialize done
 ```
 
@@ -309,9 +313,10 @@ Both sides should also print UDP receive diagnostics:
 [UDP recv] packets=... from=... q_delta_norm=... dq_norm=...
 ```
 
-There is no predefined initial joint posture. Before the first close, the
-follower holds the pose it had when the process started while the leader can be
-positioned manually. Every close re-zeros the leader/follower motion mapping.
+There is no predefined numeric initial joint posture. Before the first close,
+the follower holds the pose it had when the process started and the leader
+automatically moves to that follower joint pose. Every close re-zeros the
+leader/follower motion mapping.
 
 Before collecting a full dataset, record two or three episodes and validate
 all committed RGB-D frames and timestamp joins. Raw acquisition stays on the

@@ -198,6 +198,8 @@ int main(int argc, char **argv)
   const double lift_velocity_tolerance_mps =
       parameter.value("lift_velocity_tolerance_mps", 0.005);
   const int lift_hold_cycles = parameter.value("lift_hold_cycles", 200);
+  const double leader_initialization_speed_factor =
+      parameter.value("leader_initialization_speed_factor", 0.05);
   const double tcp_z_stiffness =
       parameter.value("tcp_z_stiffness", 1000.0);
   const double tcp_z_damping = parameter.value(
@@ -205,6 +207,8 @@ int main(int argc, char **argv)
   if (maze_cycle && (!lock_tcp_z || automatic_lift_m <= 0.0 ||
                      lift_tolerance_m <= 0.0 ||
                      lift_velocity_tolerance_mps <= 0.0 || lift_hold_cycles <= 0 ||
+                     leader_initialization_speed_factor <= 0.0 ||
+                     leader_initialization_speed_factor > 1.0 ||
                      tcp_z_stiffness <= 0.0 || tcp_z_damping < 0.0 ||
                      !std::isfinite(tcp_z_stiffness) ||
                      !std::isfinite(tcp_z_damping)))
@@ -317,6 +321,8 @@ int main(int argc, char **argv)
   std::thread t_send;
   std::thread t_recv;
   std::thread t_gripper;
+  std::thread t_initialization_heartbeat;
+  std::atomic<bool> initialization_heartbeat_running{false};
   int exit_code = 0;
   bool control_diagnostics_valid = false;
   std::array<double, 7> last_q_measured = {{0, 0, 0, 0, 0, 0, 0}};
@@ -355,6 +361,35 @@ int main(int argc, char **argv)
     std::cout << "q0=" << initial_state.q << std::endl;
     std::cout << "x0=" << position_ini << std::endl;
 
+    {
+      std::lock_guard<std::mutex> lock(Data2Send.mutex);
+      Data2Send.q_local_absolute = initial_state.q;
+      Data2Send.robot_state_valid = 1.0;
+      Data2Send.episode_phase = static_cast<double>(kResetOrAlign);
+      send_allowed = true;
+    }
+    cv_send.notify_one();
+
+    // The follower may enter its torque callback while the leader is still
+    // homing or moving. Keep sending the latest initialization state so its
+    // communication watchdog sees a live peer throughout this sequence.
+    if (leadorfollow == "l")
+    {
+      initialization_heartbeat_running.store(true);
+      t_initialization_heartbeat = std::thread([&]()
+      {
+        while (running && initialization_heartbeat_running.load())
+        {
+          {
+            std::lock_guard<std::mutex> lock(Data2Send.mutex);
+            send_allowed = true;
+          }
+          cv_send.notify_one();
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+      });
+    }
+
     bool follower_initially_grasped = false;
     std::cout << "[Gripper Init] Connecting to gripper at " << robot_ip << "..." << std::endl;
     gripper_ptr = std::make_unique<franka::Gripper>(robot_ip);
@@ -386,9 +421,69 @@ int main(int argc, char **argv)
     }
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
-    std::cout << "[Maze] No automatic joint reset. Align the leader with the "
-                 "follower manually, then close the leader gripper."
-              << std::endl;
+    if (leadorfollow == "l")
+    {
+      std::cout << "[Maze Init] Waiting for the follower's current joint pose."
+                << std::endl;
+      const auto initialization_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      while (running && std::chrono::steady_clock::now() < initialization_deadline)
+      {
+        bool follower_state_ready = false;
+        {
+          std::lock_guard<std::mutex> lock(Data2Recv.mutex);
+          follower_state_ready = Data2Recv.robot_state_valid > 0.5;
+        }
+        if (follower_state_ready)
+        {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+
+      std::array<double, 7> follower_q;
+      {
+        std::lock_guard<std::mutex> lock(Data2Recv.mutex);
+        if (Data2Recv.robot_state_valid <= 0.5)
+        {
+          throw std::runtime_error(
+              "timed out waiting for the follower joint pose");
+        }
+        follower_q = Data2Recv.q_remote_absolute;
+      }
+      for (double joint : follower_q)
+      {
+        if (!std::isfinite(joint))
+        {
+          throw std::runtime_error("received a non-finite follower joint pose");
+        }
+      }
+
+      std::cout << "[Maze Init] Moving leader to follower q=" << follower_q
+                << std::endl;
+      MotionGenerator initialization_motion(
+          leader_initialization_speed_factor, follower_q);
+      robot.control([&](const franka::RobotState &state,
+                        franka::Duration period) -> franka::JointPositions
+      {
+        {
+          std::lock_guard<std::mutex> lock(Data2Send.mutex);
+          Data2Send.q_local_absolute = state.q;
+          Data2Send.robot_state_valid = 1.0;
+        }
+        return initialization_motion(state, period);
+      });
+      initial_state = robot.readOnce();
+      std::cout << "[Maze Init] Leader reached the follower pose. Close the "
+                   "leader gripper to start the first lift."
+                << std::endl;
+    }
+    else
+    {
+      std::cout << "[Maze Init] Holding the current follower pose while the "
+                   "leader initializes."
+                << std::endl;
+    }
 
     t_gripper = std::thread(gripperControl, std::ref(Data2Send), std::ref(Data2Recv),
                             std::ref(running), std::ref(*gripper_ptr), leadorfollow,
@@ -736,7 +831,7 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < 7; i++)
         {
           // Re-zero both robots at every close event. Before the first close,
-          // hold the follower still while the operator aligns the leader.
+          // hold the follower still while the leader initializes to its pose.
           // The peer publishes its phase and re-zeroed joint delta in one UDP
           // packet. Hold this robot at the freshly captured baseline until
           // that packet arrives, so a previous episode's delta cannot be
@@ -856,6 +951,8 @@ int main(int argc, char **argv)
           {
             Data2Send.pandatime = pandatime;
             Data2Send.q_local_delta = q_local_delta;
+            Data2Send.q_local_absolute = state.q;
+            Data2Send.robot_state_valid = 1.0;
             Data2Send.dq_local = dq_local;
             Data2Send.teleop_active = teleop_active;
             if (tau_ext_feedback)
@@ -879,6 +976,8 @@ int main(int argc, char **argv)
           {
             Data2Send.pandatime = pandatime;
             Data2Send.q_local_delta = q_local_delta;
+            Data2Send.q_local_absolute = state.q;
+            Data2Send.robot_state_valid = 1.0;
             Data2Send.dq_local = dq_local;
             if (tau_ext_feedback)
               Data2Send.tau_local = tau_ext;
@@ -998,6 +1097,11 @@ int main(int argc, char **argv)
       return tau_d_rate_limited;
     };
 
+    initialization_heartbeat_running.store(false);
+    if (t_initialization_heartbeat.joinable())
+    {
+      t_initialization_heartbeat.join();
+    }
     robot.control(impedance_control_callback);
   }
   catch (const std::exception &ex)
@@ -1031,10 +1135,10 @@ int main(int argc, char **argv)
         servaddr.sin_port = htons(PORTSend);
         servaddr.sin_addr.s_addr = inet_addr(IP_remote);
 
-        // Keep emergency stop packets compatible with the normal 33-double
+        // Keep emergency stop packets compatible with the normal 41-double
         // UDP protocol. A legacy packet is rejected by the peer and
         // would make the peer report a watchdog timeout instead of stopping.
-        const int NoDatatosend = 33;
+        const int NoDatatosend = 41;
         double msg2send[NoDatatosend] = {0};
 
         msg2send[29] = 1.0;
@@ -1060,6 +1164,12 @@ int main(int argc, char **argv)
   if (t_gripper.joinable())
   {
     t_gripper.join();
+  }
+
+  initialization_heartbeat_running.store(false);
+  if (t_initialization_heartbeat.joinable())
+  {
+    t_initialization_heartbeat.join();
   }
 
   t_send.detach();
@@ -1634,7 +1744,7 @@ void udpwithremote_send(send_data &Data2send, std::atomic<bool> &running)
   servaddr.sin_addr.s_addr = inet_addr(IP_remote); // 10.162.15.208 10.162.15.234
 
   // const int NoDatatoSend = 29;
-  const int NoDatatoSend = 33;
+  const int NoDatatoSend = 41;
 
   while (running)
   {
@@ -1656,7 +1766,11 @@ void udpwithremote_send(send_data &Data2send, std::atomic<bool> &running)
           Data2send.f_local[2], Data2send.f_local[3], Data2send.f_local[4],
           Data2send.f_local[5], Data2send.energy, Data2send.stop_code,
           Data2send.gripper_width.load(std::memory_order_acquire),
-          Data2send.teleop_active, Data2send.episode_phase};
+          Data2send.teleop_active, Data2send.episode_phase,
+          Data2send.q_local_absolute[0], Data2send.q_local_absolute[1],
+          Data2send.q_local_absolute[2], Data2send.q_local_absolute[3],
+          Data2send.q_local_absolute[4], Data2send.q_local_absolute[5],
+          Data2send.q_local_absolute[6], Data2send.robot_state_valid};
       send_allowed = false;
     }
 
@@ -1703,7 +1817,7 @@ void udpwithremote_recv(recv_data &Data2Recv, std::atomic<bool> &running)
   len = sizeof(cliaddr); // len is value/resuslt
 
   // const int NoDatatoRecv = 29; // 3*7+6+1+1
-  const int NoDatatoRecv = 33;
+  const int NoDatatoRecv = 41;
 
   double msg2recv[NoDatatoRecv];
   uint64_t recv_count = 0;
@@ -1773,6 +1887,11 @@ void udpwithremote_recv(recv_data &Data2Recv, std::atomic<bool> &running)
       Data2Recv.gripper_width = msg2recv[30];
       Data2Recv.teleop_active = msg2recv[31];
       Data2Recv.episode_phase = msg2recv[32];
+      for (int i = 0; i < 7; ++i)
+      {
+        Data2Recv.q_remote_absolute[i] = msg2recv[33 + i];
+      }
+      Data2Recv.robot_state_valid = msg2recv[40];
       Data2Recv.last_receive_time_ns.store(steady_time_ns(), std::memory_order_release);
       Data2Recv.has_received.store(true);
 

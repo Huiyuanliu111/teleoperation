@@ -10,6 +10,7 @@
     "record_camera": true,
     "maze_cycle": true,
     "automatic_lift_m": 0.02,
+    "leader_initialization_speed_factor": 0.05,
     "lift_tolerance_m": 0.001,
     "lift_velocity_tolerance_mps": 0.005,
     "lift_hold_cycles": 200,
