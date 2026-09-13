@@ -1409,32 +1409,60 @@ void gripperControl(send_data &Data2Send, recv_data &Data2Recv, std::atomic<bool
           close_samples = 0;
           close_armed = false;
           cycle_in_progress = true;
+          bool local_close_ready = true;
           if (leadorfollow == "f")
           {
-            const double max_width = gripper.readOnce().max_width;
-            const bool grasp_confirmed =
-                gripper.grasp(0.0, 0.05, grasp_force, 0.0, max_width);
-            const franka::GripperState grasp_state = gripper.readOnce();
+            // First close to locate the object's actual width. For objects
+            // wider than 5 mm this probe is expected to return false, but its
+            // final state gives us the contact width for a force-holding grasp.
+            bool grasp_confirmed =
+                gripper.grasp(0.0, 0.05, grasp_force, 0.005, 0.005);
+            franka::GripperState grasp_state = gripper.readOnce();
             g_follower_gripper_width.store(grasp_state.width);
-            if (!grasp_confirmed)
+            if (!grasp_confirmed || !grasp_state.is_grasped)
             {
-              // libfranka returns false when its internal grasp predicate is
-              // not satisfied, even though the fingers have closed and may be
-              // holding the object. The leader's close transition defines the
-              // episode boundary, so preserve the actual gripper state and
-              // continue into the synchronized lift.
-              std::cerr << "[Follower Gripper] Close command completed without "
-                           "libfranka grasp confirmation; continuing with width="
+              constexpr double kMinimumObjectWidthM = 0.002;
+              constexpr double kGripPreloadM = 0.002;
+              if (grasp_state.width > kMinimumObjectWidthM)
+              {
+                const double holding_target_width =
+                    std::max(0.0, grasp_state.width - kGripPreloadM);
+                std::cout << "[Follower Gripper] Contact detected at width="
+                          << grasp_state.width << " m; applying " << grasp_force
+                          << " N holding grasp with target="
+                          << holding_target_width << " m." << std::endl;
+                grasp_confirmed = gripper.grasp(
+                    holding_target_width, 0.02, grasp_force, 0.005, 0.005);
+                grasp_state = gripper.readOnce();
+                g_follower_gripper_width.store(grasp_state.width);
+              }
+            }
+
+            if (!grasp_confirmed || !grasp_state.is_grasped)
+            {
+              local_close_ready = false;
+              std::cerr << "[Follower Gripper] Object is not securely grasped; "
+                           "lift cancelled. width="
                         << grasp_state.width
-                        << " m, is_grasped=" << grasp_state.is_grasped << "."
+                        << " m, is_grasped=" << grasp_state.is_grasped
+                        << ". Open and close the leader gripper to retry."
                         << std::endl;
             }
-            prepare_episode();
+            else
+            {
+              std::cout << "[Follower Gripper] Object secured at width="
+                        << grasp_state.width << " m with force=" << grasp_force
+                        << " N." << std::endl;
+              prepare_episode();
+            }
           }
-          g_episode_phase.store(kCloseDetected);
-          std::cout << "[Maze] Close confirmed; waiting for both robots, then lifting "
-                    << g_automatic_lift_m << " m."
-                    << std::endl;
+          if (local_close_ready)
+          {
+            g_episode_phase.store(kCloseDetected);
+            std::cout << "[Maze] Close confirmed; waiting for both robots, then lifting "
+                      << g_automatic_lift_m << " m."
+                      << std::endl;
+          }
         }
       }
       else if (target_width >= close_threshold)
