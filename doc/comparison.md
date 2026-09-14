@@ -1,8 +1,8 @@
-# PlanARP：required-only 与 full-then-truncate 比较方案
+# PlanARP：required-only 与 full-then-truncate 实现与比较记录
 
-更新时间：2026-09-14。本文依据当前本地代码整理，区分已有功能与待实现方案。
+更新时间：2026-09-14。本文记录本地实现、验证结果与尚未完成的实验。
 
-**结论：可以用同一个 PlanARP checkpoint 做比较，无需重新训练策略。当前完整生成后截取的路径已存在，required-only、配对同步计时和两种模式的真机对照尚未完成。** 本文没有新的 PlanARP 性能实验结果。
+**结论：可以用同一个 PlanARP checkpoint 做比较，无需重新训练策略。两种推理模式、固定长度 / MVT selector / endpoint 调度接入和离线配对计时脚本均已实现；默认仍为 full_then_truncate。真机对照尚未完成。** 本文没有新的 PlanARP 性能实验结果。
 
 ## 1. 比较目标与参考
 
@@ -96,9 +96,9 @@ token 数包含计划、不含共同的 6 个 prompt token。执行 3 步时生�
                          → 使用同一视觉特征生成完整动作
 ```
 
-这是最接近 ALOHA 比较流程的接口。已有 `--chunk-selector` 加载与执行前缀选择，`predict_action(..., visual_features=...)` 支持复用编码结果。但当前 MVT selector 路径显式只允许 `full_then_truncate`。
+这是最接近 ALOHA 比较流程的接口。已有 `--chunk-selector` 加载与执行前缀选择，`predict_action(..., visual_features=...)` 支持复用编码结果。现在支持两种模式，将 selector 选出的 h 传给策略。在批量接口中取 batch 内最大的 h，真机使用 batch size 1。
 
-接入 required-only 后，配对测量只运行一次 selector、固定其选择，再分别解码。候选长度必须以实际 selector checkpoint 为准，不能直接套用 ALOHA 的 20/40/60。本文未确认某个 selector checkpoint 的真机有效性。
+后续 live 配对测量应只运行一次 selector、固定其选择，再分别解码。当前新增脚本使用离线观测和指定 h，不运行 selector。候选长度必须以实际 selector checkpoint 为准，不能直接套用 ALOHA 的 20/40/60。本文未确认某个 selector checkpoint 的真机有效性。
 
 
 ## 5. 实现难度与工作项
@@ -116,9 +116,9 @@ token 数包含计划、不含共同的 6 个 prompt token。执行 3 步时生�
 | 逐调用同步计时 | 中 | CUDA event、同步、交替顺序、视觉缓存口径、逐调用日志与前缀差异 |
 | 真机闭环对照 | 高 | 初始状态复现、接触条件差异、独立运行两模式、成功判定、足够样本与统计分析 |
 
-最小验证不需要重训策略，也不需要改变 plan_steps、horizon 或 action_chunk_size。策略代码支持长度控制后，应继续严格加载同一个 checkpoint。
+本次未重训策略，未改变 plan_steps、horizon 或 action_chunk_size。策略支持长度控制，同一个 checkpoint 的参数结构保持兼容。
 
-建议实现顺序：固定 h 的按需生成与前缀测试 → 离线同步计时排错 → 选定一种调度器接入 → 实际调用配对计时 → 独立真机闭环对照。
+固定 h、两种调度器接入和离线配对工具已完成；实际闭环调用配对计时与独立真机对照仍待开展。上表难度是工程判断，完成状态见第 8 节。
 
 ## 6. 安全检查与比较公平性
 
@@ -126,7 +126,9 @@ token 数包含计划、不含共同的 6 个 prompt token。执行 3 步时生�
 
 full 有 10 步可检查，required 精细阶段只有 4 步。full 可能因为第 8 步异常中止，required 则没有生成第 8 步。因此，即使前三步一致，两者的中止行为也可能不同。
 
-实现前需要明确实验协议：
+本次采用“检查全部已生成动作”的协议，保留原阈值。固定步数的 MVT 路径也统一从 action_pred 获取全部生成动作，full 模式可能比此前只检查截取后的 action 更早中止。成功周期记录生成、检查、选择与下发步数；原始动作阈值中止会记录异常步和 executed_steps=0。未生成的后缀不在 required 的检查范围内，闭环比较必须报告这一差异。
+
+后续实验需注意：
 
 - 延迟与输出前缀比较可以先独立完成，不要求实际执行动作。
 - 若保留“检查全部生成动作”，必须将检查长度、异常所在步和中止次数分别记录，将差异作为混杂因素报告。
@@ -160,22 +162,82 @@ full 有 10 步可检查，required 精细阶段只有 4 步。full 可能因为
 
 报告成功率及区间、完成时间、policy 调用次数、实际执行步数、精细阶段耗时、安全中止次数。只有预先定义了有效配对的 trials，才使用配对成功率检验；不能把不相关的真机 episodes 强行配对。
 
-## 8. 当前实现状态
+## 8. 当前实现状态与使用方式
 
 | 项目 | 状态 | 证据或限制 |
 |---|---|---|
-| 4 个计划位姿 + 10 步动作生成 | 已实现 | 策略推理循环仍按 self.horizon 完整生成 |
-| 执行完整生成序列的前缀 | 已实现 | 固定步数、endpoint schedule、MVT selector 均有路径 |
-| endpoint 10→3 调度 | 已实现 | 依赖当前位置及完整预测路径，精细状态保持 |
-| MVT selector 先选 h | 接口已实现 | 可共享视觉特征；当前只允许 full_then_truncate |
-| visual_features 缓存参数 | 已实现 | 可供后续配对解码复用 |
-| PlanARP required-only | **未实现** | 当前没有 requested_steps 控制实际生成长度 |
-| 按组取整并验证前缀一致 | **未实现** | 需要补充策略和 checkpoint 测试 |
-| 两种模式的安全检查协议 | **待确定** | 整段候选检查与生成长度不同存在冲突 |
-| PlanARP 配对 CUDA 同步计时 | **未实现/未测量** | 现有 MVT selector 路径使用 CPU monotonic 计时，不等于文档中的逐调用同步计时 |
-| PlanARP 两模式真机成功率对照 | **未完成** | 不能从 ALOHA 结果或监督验证 loss 推断 |
+| full_then_truncate | 已实现，默认 | 完整计划 + horizon 动作，执行所选前缀 |
+| required_only | 已实现 | 完整计划 + 向上取整到完整动作组 |
+| 固定执行长度 | 已接入 | --execute-steps 传入 requested_steps |
+| MVT selector | 两模式已接入 | 先选 h，两者共享一次视觉编码 |
+| endpoint 10→3 | 两模式已接入 | 粗阶段和首次进入细阶段的调用生成 10；锁定 fine 后 required 生成 4、选择 3 |
+| 前缀一致性 | 单元测试通过 | 真实 ARP decoder，覆盖奇偶 h、不同分组、计划和夹爪配置 |
+| 安全检查 | 已统一口径 | 检查全部已生成动作；两模式检查长度不同 |
+| 离线配对计时 | 工具已实现 | CUDA event + 同步 / CPU wall time；两种缓存口径分开 |
+| live selector 配对计时 | 未实现 | 离线脚本不能替代真实闭环调用分布 |
+| 真机成功率对照 | 未开展 | 尚无 PlanARP GPU 加速或真机效果结论 |
 
-部署脚本已有 `--prediction-mode` 参数，但这不代表 MVT PlanARP 已支持 required-only。带 MVT selector 时非 full 模式目前会显式报错；不带 selector 时，也不能仅凭传入该参数就宣称策略进行了按需生成。
+策略接口：
+
+```python
+prediction = policy.predict_action(
+    obs,
+    prediction_mode="required_only",  # 或 full_then_truncate
+    requested_steps=3,
+    # visual_features=visual,  # 可选，两模式需采用相同缓存条件
+)
+```
+
+`requested_steps` 为 1 到 horizon 的整数，省略时采用策略的 n_action_steps。
+`action_pred`、`target_control_points` 的长度为 generated_steps；`action` 为 requested_steps。
+`plan_control_points` 保持完整。`prediction_diagnostics` 返回模式、requested_steps、generated_steps、计划 / 动作 token 数和动作组数。
+
+在现有 Cartesian 部署命令中切换以下参数即可，checkpoint 与其他控制参数保持相同：
+
+```bash
+# 固定执行 3 步，完整生成 10 步
+--prediction-mode full_then_truncate --execute-steps 3 --trace-output /tmp/planarp_full.jsonl
+
+# 固定执行 3 步，按需生成 4 步
+--prediction-mode required_only --execute-steps 3 --trace-output /tmp/planarp_required.jsonl
+```
+
+使用已有 `--chunk-selector` 时，由 selector 决定 h。使用 endpoint schedule 时，由调度状态决定 h：首次跨入精细区域仍需完整预测路径，该调用 requested/generated=10、selected=3；后续 required 调用 requested=3、generated=4、selected=3。reset 清除 fine 锁定。两种调度器不能同时使用。
+
+trace 的 executed_steps 表示本周期计划下发的前缀长度（dry-run 或原始动作拒绝为 0），不表示机器人反馈确认完成的步数。轨迹中断或异步覆盖时不能将它当作物理完成步数。两种模式仍对所有已生成候选执行原有原始阈值检查、积分和裁剪。
+
+### 离线复现命令
+
+从 threading_real 目录运行；不连接机器人：
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 /home/huiyuan/miniconda3/envs/arp/bin/python \
+  scripts/diagnostics/compare_planarp_prediction_modes.py \
+  --checkpoint outputs/threading_combined_80_mvt_planarp_v2/20260912_121546/checkpoints/epoch=0004-val_loss=10.198.ckpt \
+  --dataset /home/huiyuan/teleoperation/data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5 \
+  --device cpu --samples 2 --requested-steps 3 10 --warmup 1 \
+  --output outputs/planarp_required_only_check/paired_cpu.json
+```
+
+原 checkpoint 记录的训练数据路径已不存在，此处显式使用当前 cam1 文件；这是输出一致性抽查，不是原验证集效果复现。GPU 空闲时可改成 `--device cuda:0` 并增加 samples，使用不同输出文件。脚本交替解码顺序，分别记录包含视觉编码的整次调用、共享视觉后的计划与动作生成；不复用计划。JSON 保存逐调用生成量、平移差异、SO(3) 旋转差异、控制点、计划与夹爪差异。
+
+### 2026-09-14 验证记录
+
+- 上述 checkpoint 以 model 权重加载，220/220 参数键匹配。
+- 使用 cam1 数据集划分后的两个观测：episode_000000 / frame 0、episode_000061 / frame 118；h=3 和 h=10，各测两种计时口径，共 8 组配对。
+- CPU 上全部配对的执行前缀平移、SO(3) 旋转、控制点、夹爪以及完整计划差异均为 0。h=3 时 full / required 分别生成 10 / 4 步；h=10 时都生成 10 步。
+- 这是两个观测的正确性抽查，不能证明所有观测、CUDA 数值路径或闭环轨迹都一致。当前 GPU 有其他任务，本次没有进行 GPU 性能测量；JSON 中 CPU 时间仅供排错。
+- 相关测试共 **63 passed**，包含策略、模式路由、endpoint schedule、Cartesian 部署和 selector；git diff --check 通过。
+- [8 组原始配对结果](../threading_real/outputs/planarp_required_only_check/paired_cpu.json)。该 outputs 文件是本地生成结果，未保证纳入版本控制。
+
+验证命令（threading_real 目录）：
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=. /home/huiyuan/miniconda3/envs/arp/bin/python -m pytest \
+  tests/test_mvt_arp.py tests/test_mvt_prediction_modes.py \
+  tests/test_endpoint_schedule.py tests/test_deploy_threading_real_cartesian.py \
+  tests/test_chunk_selector.py -q
+```
 
 ## 9. 相关代码与文件
 
@@ -188,4 +250,7 @@ full 有 10 步可检查，required 精细阶段只有 4 步。full 可能因为
 - [PlanARP v2 训练 YAML](../threading_real/pushbox/configs/threading_combined_80_mvt_planarp_v2.yaml)
 - [ALOHA 比较参考](/home/huiyuan/arp/aloha/doc/comparison.md)
 
-本文仅记录方案与状态，未修改推理行为、重启训练或启动真机实验。
+本次实现了推理模式切换与离线比较工具，未重启训练或启动真机实验。
+
+- [离线配对脚本](../threading_real/scripts/diagnostics/compare_planarp_prediction_modes.py)
+- [部署模式测试](../threading_real/tests/test_mvt_prediction_modes.py)
