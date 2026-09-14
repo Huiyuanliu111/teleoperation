@@ -5,7 +5,7 @@ maze任务是先精细区后非精细区。比较好的是前30%后70%。精细�
 
 标注数据使用soft label。给予可能性。
 精细区标h，非精细区标H。
-这里H=10，h可以是小于10的整数。我们选择（3，4，5）其中一个作为候选。
+两个任务当前统一使用 h=4、H=10。
 
 标注好数据以后，我需要可视化chunk分布，以及节点对应的视频帧。
 
@@ -16,8 +16,10 @@ maze任务是先精细区后非精细区。比较好的是前30%后70%。精细�
 ## 当前实现（spatial_rule_v1）
 
 百分比默认按 TCP 3D **累计路程**计算，可通过 `--progress-mode frames` 改为帧数进度。
-当前默认 `h=3`、`H=10`；`--h 4` 或 `--h 5` 可切换候选下限。
-本次训练使用 Threading 50% 节点、Maze 30% 节点，`h=3`、`H=10`。
+当前默认 `h=4`、`H=10`；两个任务部署输出均为 4–10 步。
+Threading 使用 50% 节点、Maze 使用 30% 节点。已有权重是在 h=3 下训练的精细区概率模型；
+当前部署将概率映射改为 `c = 4*p_fine + 10*(1-p_fine)`，取 `floor(c+0.5)`。
+概率标签不依赖 h，因此无需重训。h4 部署快照及命令见 [deploy_selector.md](deploy_selector.md)。
 60%、70%、80% 的结果保留用于历史对照。
 
 当前 spatial rule 用球形区域描述精细区，与已有 endpoint schedule 的空间定义一致：
@@ -94,16 +96,16 @@ HDF5、OpenCV、Matplotlib、PyTorch 和 ARP 依赖的环境（本机为 conda `
 ```bash
 python threading_real/scripts/chunk_selector/label_spatial.py \
   data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5 \
-  --task threading --h 3 --split-progress 0.5 \
-  --output data/analysis/threading_spatial_h3_p50
+  --task threading --h 4 --split-progress 0.5 \
+  --output data/analysis/threading_spatial_h4_p50
 
 python threading_real/scripts/chunk_selector/label_spatial.py \
   data/datasets/maze_train49_mvt_7p5hz.h5 \
-  --task maze --h 3 --split-progress 0.3 \
-  --output data/analysis/maze_spatial_h3_p30
+  --task maze --h 4 --split-progress 0.3 \
+  --output data/analysis/maze_spatial_h4_p30
 
 python threading_real/scripts/chunk_selector/visualize_spatial.py \
-  data/analysis/maze_spatial_h3_p30 --output data/analysis/maze_spatial_h3_p30/report
+  data/analysis/maze_spatial_h4_p30 --output data/analysis/maze_spatial_h4_p30/report
 ```
 
 标注输出 `labels.parquet` 和 `summary.json`，保存完整规则、训练/验证 episode 清单、
@@ -133,26 +135,26 @@ TCP、速度、进度或动作。TCP 只用于离线构造监督。
 ```bash
 python threading_real/scripts/chunk_selector/extract_mvt_features.py \
   threading_real/outputs/threading_combined_80_mvt_cam1_planarp_v2/20260912_171342/checkpoints/latest.ckpt \
-  data/analysis/threading_spatial_h3_p50 \
+  data/analysis/threading_spatial_h4_p50 \
   --dataset-path data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5 \
-  --output data/threading_spatial_mvt_features.h5 \
+  --output data/threading_spatial_h4_mvt_features.h5 \
   --device cuda:0 --batch-size 2
 
 python threading_real/scripts/chunk_selector/extract_mvt_features.py \
   maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt \
-  data/analysis/maze_spatial_h3_p30 \
+  data/analysis/maze_spatial_h4_p30 \
   --dataset-path data/datasets/maze_train49_mvt_7p5hz.h5 \
-  --output data/maze_spatial_mvt_features.h5 \
+  --output data/maze_spatial_h4_mvt_features.h5 \
   --device cuda:0 --batch-size 2
 
 python threading_real/scripts/chunk_selector/train.py \
-  data/threading_spatial_mvt_features.h5 \
-  --output-dir threading_real/outputs/selector_spatial_h3_p50 \
+  data/threading_spatial_h4_mvt_features.h5 \
+  --output-dir threading_real/outputs/selector_spatial_h4_p50 \
   --device cuda:0 --batch-size 4 --epochs 100
 
 python threading_real/scripts/chunk_selector/train.py \
-  data/maze_spatial_mvt_features.h5 \
-  --output-dir maze_real/outputs/selector_spatial_h3_p30 \
+  data/maze_spatial_h4_mvt_features.h5 \
+  --output-dir maze_real/outputs/selector_spatial_h4_p30 \
   --device cuda:0 --batch-size 4 --epochs 100
 ```
 
@@ -176,12 +178,12 @@ Threading MVT 当前使用 `--prediction-mode full_then_truncate`，不可同时
 # 默认为不执行机器人动作的诊断运行；需要相机与机器人状态连接。
 python threading_real/scripts/deployment/cartesian.py \
   threading_real/outputs/threading_combined_80_mvt_cam1_planarp_v2/20260912_171342/checkpoints/latest.ckpt \
-  --chunk-selector threading_real/outputs/selector_spatial_h3_p50 \
+  --chunk-selector data/analysis/selector_eval_20260914_142324/models/threading_h4 \
   --weights model --prediction-mode full_then_truncate --max-cycles 5
 
 python maze_real/scripts/deployment/cartesian.py \
   maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt \
-  --selector maze_real/outputs/selector_spatial_h3_p30 \
+  --selector data/analysis/selector_eval_20260914_142324/models/maze_h4 \
   --weights model --calibration threading_real/calibration/block_grasp_spatial.json --max-cycles 5
 ```
 
@@ -214,7 +216,7 @@ python threading_real/scripts/chunk_selector/export_spatial_frames.py \
 `colors[T,N,3]` 是点的颜色，不是原始 RGB 图像；点云 PNG 使用 MVT top/left 虚拟视角，
 图片中明确标注来源，不能当作原视频截图。
 
-## 本次后台训练（2026-09-14）
+## 历史 h3 后台训练（2026-09-14）
 
 已启动两个独立的“特征提取 → 完整性检查 → selector 训练”后台任务。
 Threading 使用 50% 节点（64 条训练 / 16 条验证）；Maze 使用 30% 节点
