@@ -30,6 +30,7 @@ outputs/
 *.log
 
 .cache/
+training_runs/
 # Logs
 *.log
 data/
