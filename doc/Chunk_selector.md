@@ -1,3 +1,6 @@
+> 本文的 h3/h4、H10 和 spatial rule 命令为历史实验。当前 H20/H50 配对模型部署见 [deploy_selector.md](deploy_selector.md)。
+> 2026-09-16 标签目录整理后，已迁移标签从 `data/datasets/selector/` 读取，可视化仍输出到 `data/analysis/`。
+
 chunk selector标数据：称作spatial rule。
 按照训练集任务轨迹，按照TCP的3D位置轨迹划分不同的任务阶段。
 Threading real划分两段任务：第一个是非精细区，第二个是精细区。目前使用前50%后50%
@@ -97,15 +100,15 @@ HDF5、OpenCV、Matplotlib、PyTorch 和 ARP 依赖的环境（本机为 conda `
 python threading_real/scripts/chunk_selector/label_spatial.py \
   data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5 \
   --task threading --h 4 --split-progress 0.5 \
-  --output data/analysis/threading_spatial_h4_p50
+  --output data/datasets/selector/threading_spatial_h4_p50
 
 python threading_real/scripts/chunk_selector/label_spatial.py \
   data/datasets/maze_train49_mvt_7p5hz.h5 \
   --task maze --h 4 --split-progress 0.3 \
-  --output data/analysis/maze_spatial_h4_p30
+  --output data/datasets/selector/maze_spatial_h4_p30
 
 python threading_real/scripts/chunk_selector/visualize_spatial.py \
-  data/analysis/maze_spatial_h4_p30 --output data/analysis/maze_spatial_h4_p30/report
+  data/datasets/selector/maze_spatial_h4_p30 --output data/analysis/maze_spatial_h4_p30/report
 ```
 
 标注输出 `labels.parquet` 和 `summary.json`，保存完整规则、训练/验证 episode 清单、
@@ -117,14 +120,14 @@ python threading_real/scripts/chunk_selector/visualize_spatial.py \
 可通过 `--episodes episode_000000 ...` 选择 episode，通过 `--frame-offset` 调整前后范围。
 用 `--raw-root` 指定搬迁后的原始视频根目录。视频缺失时仍生成图表并明确记录缺失原因。
 
-已生成的本地结果：
+旧报告及截图已清理，保留以下标签与规则：
 
-- [Threading 80% 报告](../data/analysis/threading_spatial_h3_p80/report/index.html)：80 条轨迹，11,273 帧。
-- [Threading 70% 对照报告](../data/analysis/threading_spatial_h3_p70/report/index.html)。
-- [Maze 30% 报告](../data/analysis/maze_spatial_h3_p30/report/index.html)：49 条轨迹，3,437 帧，183 张节点视频帧。
+- [Threading 80% 标签](../data/datasets/selector/threading_spatial_h3_p80/summary.json)：80 条轨迹、11,273 帧。
+- [Threading 70% 标签](../data/datasets/selector/threading_spatial_h3_p70/summary.json)。
+- [Maze 30% 标签](../data/datasets/selector/maze_spatial_h3_p30/summary.json)：49 条轨迹、3,437 帧。
 
-Threading HDF5 记录的原始视频根目录 `data/threading_new` 当前不存在，因此对应报告尚无
-原始视频截图；所需的文件路径和精确帧号已写入报告。
+需要时重新运行可视化命令。Threading 原始视频根目录 `data/threading_new` 当前不存在，
+点云渲染可直接使用 HDF5，原视频截图仍需对应原始视频。
 
 ## ARP MVT 特征 → Transformer selector
 
@@ -135,14 +138,14 @@ TCP、速度、进度或动作。TCP 只用于离线构造监督。
 ```bash
 python threading_real/scripts/chunk_selector/extract_mvt_features.py \
   threading_real/outputs/threading_combined_80_mvt_cam1_planarp_v2/20260912_171342/checkpoints/latest.ckpt \
-  data/analysis/threading_spatial_h4_p50 \
+  data/datasets/selector/threading_spatial_h4_p50 \
   --dataset-path data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5 \
   --output data/threading_spatial_h4_mvt_features.h5 \
   --device cuda:0 --batch-size 2
 
 python threading_real/scripts/chunk_selector/extract_mvt_features.py \
   maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt \
-  data/analysis/maze_spatial_h4_p30 \
+  data/datasets/selector/maze_spatial_h4_p30 \
   --dataset-path data/datasets/maze_train49_mvt_7p5hz.h5 \
   --output data/maze_spatial_h4_mvt_features.h5 \
   --device cuda:0 --batch-size 2
@@ -174,20 +177,8 @@ Threading Cartesian runner 的 `--chunk-selector` 已支持 MVT ARP；Maze runne
 Threading MVT 当前使用 `--prediction-mode full_then_truncate`，不可同时指定
 `--execution-schedule`。原始预测经过 runner 现有检查和裁剪后再执行所选前缀。
 
-```bash
-# 默认为不执行机器人动作的诊断运行；需要相机与机器人状态连接。
-python threading_real/scripts/deployment/cartesian.py \
-  threading_real/outputs/threading_combined_80_mvt_cam1_planarp_v2/20260912_171342/checkpoints/latest.ckpt \
-  --chunk-selector data/analysis/selector_eval_20260914_142324/models/threading_h4 \
-  --weights model --prediction-mode full_then_truncate --max-cycles 5
-
-python maze_real/scripts/deployment/cartesian.py \
-  maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt \
-  --selector data/analysis/selector_eval_20260914_142324/models/maze_h4 \
-  --weights model --calibration threading_real/calibration/block_grasp_spatial.json --max-cycles 5
-```
-
-上面是手动运行模板；本次后台训练的实际输出目录和日志见文末。尚未进行真机执行。
+当前可用的模型配对、完整路径和部署命令统一见 [deploy_selector.md](deploy_selector.md)。
+`selector_eval_20260914_142324` 保留 H10 历史模型与评估记录；使用时须配对原 H10 编码器。
 
 ## 直接导出 PNG（无需 HTML）
 
@@ -199,20 +190,19 @@ python maze_real/scripts/deployment/cartesian.py \
 
 ```bash
 python threading_real/scripts/chunk_selector/export_spatial_frames.py \
-  data/analysis/maze_spatial_h3_p30 \
+  data/datasets/selector/maze_spatial_h3_p30 \
   --dataset data/datasets/maze_train49_mvt_7p5hz.h5 \
   --raw-root data/raw/maze_data_train49 \
   --source-kind video --output data/analysis/maze_spatial_h3_p30/png_frames
 
 python threading_real/scripts/chunk_selector/export_spatial_frames.py \
-  data/analysis/threading_spatial_h3_p80 \
+  data/datasets/selector/threading_spatial_h3_p80 \
   --dataset data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5 \
   --source-kind pointcloud --device cuda:0 \
   --output data/analysis/threading_spatial_h3_p80/pointcloud_png
 ```
 
-以上输出已生成：Maze 为 183 张原视频 PNG；Threading 80% / 70% 分界分别为
-293 / 294 张点云 PNG。Threading 的 HDF5 可直接用于标注、特征提取和训练，但其
+以上输出曾生成，现已清理；重新运行可恢复相应输出（原视频截图需原始视频可用）。Threading 的 HDF5 可直接用于标注、特征提取和训练，但其
 `colors[T,N,3]` 是点的颜色，不是原始 RGB 图像；点云 PNG 使用 MVT top/left 虚拟视角，
 图片中明确标注来源，不能当作原视频截图。
 
