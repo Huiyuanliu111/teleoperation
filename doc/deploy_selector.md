@@ -1,46 +1,54 @@
 # Selector 对照实验部署
 
-本页命令使用 2026-09-16 重训的 selector，与提取训练特征时的动作模型严格配对。
-Maze 比较 **固定 50 步** 与 **动态 20–50 步**；Threading 比较 **固定 20 步** 与 **动态 8–20 步**。
-每个条件评估 20 次，即每个任务 40 次，两个任务共 80 次。每个任务使用同一套 20 个起始条件，
-第 i 次在两种方法下尽量复现相同的物体、起始位姿和目标位置。
+本页默认与已有结果保持一致：Maze 使用 H10 策略及历史 h4 selector 快照；Threading 使用 H20 策略及 2026-09-16 重训的 h8 selector。
+Maze 比较 **固定 10 步** 与 **动态 4–10 步**；Threading 比较 **固定 20 步** 与 **动态 8–20 步**。
+新增 AAC 条件（2026-09-18）：Maze 运动量阈值 `alpha=0.04`，Threading 当前评估使用 `alpha=1`；均使用 `N=20`、执行候选 0。
+每个条件评估 20 次，即每个任务 60 次，两个任务共 120 次。每个任务使用同一套 20 个起始条件，
+第 i 次在三种方法下尽量复现相同的物体、起始位姿和目标位置。
 
 | 任务 | 条件 | 执行步数 | 归一化节点 | 评估次数 |
 | --- | --- | --- | --- | --- |
-| Maze | no selector | 固定 50 | 不使用 | 20 |
-| Maze | selector | 20–50 | 路程 30%，先细后粗 | 20 |
+| Maze | no selector | 固定 10 | 不使用 | 20 |
+| Maze | selector | 4–10 | 历史空间规则，先细后粗 | 20 |
+| Maze | AAC | 1–10 | 动作熵 + 最小运动量，不使用路程标签 | 20 |
 | Threading | no selector | 固定 20 | 不使用 | 20 |
 | Threading | selector | 8–20 | 路程 50%，先粗后细 | 20 |
+| Threading | AAC | 1–20 | 动作熵 + 最小运动量，不使用路程标签 | 20 |
 
-Maze 两组均生成完整 50 步预测，Threading 两组均生成完整 20 步预测，再执行指定长度的前缀。同一任务使用相同的 ARP checkpoint、
+Maze 两组均生成完整 10 步预测，Threading 两组均生成完整 20 步预测，再执行指定长度的前缀。同一任务使用相同的 ARP checkpoint、
 `model` 权重、7.5 Hz 控制频率、相机标定及动作限制，仅改变执行长度是否由 selector 决定。
 不启用 endpoint schedule 或额外的低置信度回退。
+上述“仅改变执行长度”适用于固定长度与 learned selector 两组。AAC 则启用 ARP 随机采样，
+每次共享一次视觉编码，生成 20 条完整预测（Threading 默认每批 1 条），用候选 0 同时计算运动量并执行其前缀；
+因此 AAC 与原确定性基线还存在采样方式及推理开销的差异，不能解释为纯执行长度消融。
 
 ## 本次模型版本
 
 | 任务 | 动作模型 | selector 最佳权重 | 执行范围 |
 | --- | --- | --- | --- |
 | Threading | H20，epoch 8，val_loss=10.981 | 路程标签重训，epoch 11 | 8–20 |
-| Maze | H50，epoch 9 | 路程标签重训，epoch 5 | 20–50 |
+| Maze | H10，epoch 209 | 历史 h4 快照，epoch 7 | 4–10 |
 
-Threading 已按用户要求停止训练，Maze 已完成训练；以下模型目录都已生成最佳权重。
-两者使用各自部署动作模型的 `model` 编码器重新提取特征，不能替换为旧 H10 selector，
-也不能仅修改候选长度后迁移到其他动作模型 checkpoint。
+Maze 使用 `maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt`，
+已核验 checkpoint 的 `horizon=10`。selector 使用历史评估快照
+`data/analysis/selector_eval_20260914_142324/models/maze_h4`，其元数据的
+`source_checkpoint` 指向该策略，`weights=model`，候选长度为 `[4,10]`。
+该快照由原 `[3,10]` selector 重映射为 `[4,10]`，概率权重未改变，沿用历史评估设置。
+[历史 selector 快照清单](../data/analysis/selector_eval_20260914_142324/manifest_h4.json)。
 
-精细区概率为 p：Threading 执行 `floor(8*p + 20*(1-p) + 0.5)`，
-Maze 执行 `floor(20*p + 50*(1-p) + 0.5)`。标签按每条轨迹的 TCP 累计路程生成：
-Threading 45%–55% 从粗区过渡到细区；Maze 25%–35% 从细区过渡到粗区。
-路程进度仅用于离线标签，在线仍由视觉 selector 预测，不能把标签切换当成已验证的真机行为。
+精细区概率为 p：Maze 执行 `floor(4*p + 10*(1-p) + 0.5)`，
+Threading 执行 `floor(8*p + 20*(1-p) + 0.5)`。
+Maze 沿用历史空间规则标签的 selector；Threading 使用累计路程标签重训版本。
+离线标签仅用于训练，在线均由视觉 selector 预测。
 
-新评估目录：`data/analysis/selector_eval_matched_20260916`。
-[模型路径与 SHA-256 清单](../data/analysis/selector_eval_matched_20260916/manifest.json)。
-新命令使用独立日志，避免与旧 H10/h4 或编码器不匹配的 h8/H20 实验混算。
-训练记录：[Threading](Selector_H20_progress_training.md)；Maze 运行目录为
-`training_runs/maze_selector_H50_h20_progress_20260916_140818`。
+本页新评估日志目录：`data/analysis/selector_eval_matched_20260916`。
+Maze 的新日志使用 `maze10_*`，与此前 H50 日志区分；下方历史结果仍引用原始 CSV，
+不搬移、不改名，也不把已有 H50 数据计入 H10 对比。
+Threading 训练记录：[Selector_H20_progress_training.md](Selector_H20_progress_training.md)。
 
 ## 运行环境
 
-下面四组部署命令均使用完整路径，可单独复制，不依赖 `MAZE_ARP` 等 shell 变量。
+下面六组部署命令均使用完整路径，可单独复制，不依赖 `MAZE_ARP` 等 shell 变量。
 在交互式终端中运行以下准备命令。部署使用 `pushbox` 环境：本机该环境具备 Pinocchio 和
 RealSense 依赖，训练使用的 `arp` 环境缺少这两个部署依赖。
 
@@ -52,13 +60,12 @@ conda activate pushbox
 mkdir -p "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs"
 ```
 
-下面四条命令包含 `--execute --confirm-real-robot`，运行后会在每轮按 Enter 开始时执行真实动作。
-四个条件依次运行，共用机器人和相机，不能同时启动。
+下面六条命令包含 `--execute --confirm-real-robot`，运行后会在每轮按 Enter 开始时执行真实动作。
+六个条件依次运行，共用机器人和相机，不能同时启动。
 
 ## Maze：每个条件 20 次
 
-H50 在 7.5 Hz 下最长执行时间约 6.67 s；以下两组命令使用 `--sync-timeout 10.0`，
-避免默认 3 s 超时在长 chunk 执行完成前中止等待。
+H10 在 7.5 Hz 下最长执行时间约 1.33 s；以下三组命令统一使用 `--sync-timeout 3.0`。
 
 每轮夹取完成后，记录当前 TCP 的 Z 为该轮固定高度；所有动作只累加 XY，所有目标点的
 Z 始终等于该固定值，不随实测高度更新。下一轮复位、夹取后重新记录高度。
@@ -78,36 +85,54 @@ Maze 默认采用**手动 guide 切换确认**，不需要设置 `MAZE_GUIDE_ENT
 手动复位后，在主终端按 Enter 准备下一轮，按提示退出 guide 并确认；随后自动夹取并开始推理。
 `--initial-grasp-width 0.02` 沿用当前夹取设置，两组保持相同。最后一轮结束后也会提示进入 guide。
 
-**无 selector：固定执行 50 步。**
+**无 selector：固定执行 10 步。**
 
 ```bash
-/home/huiyuan/miniconda3/envs/pushbox/bin/python /home/huiyuan/teleoperation/maze_real/scripts/deployment/cartesian.py "/home/huiyuan/teleoperation/training_runs/planarp_chunks_20260914_165545/maze_planarp_chunk50/checkpoints/epoch_0009.pt" \
+/home/huiyuan/miniconda3/envs/pushbox/bin/python /home/huiyuan/teleoperation/maze_real/scripts/deployment/cartesian.py "/home/huiyuan/teleoperation/maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt" \
   --weights model --device cuda:0 \
   --calibration "/home/huiyuan/teleoperation/threading_real/calibration/block_grasp_spatial.json" \
-  --policy-hz 7.5 --execute-steps 50 --sync-timeout 10.0 \
+  --policy-hz 7.5 --execute-steps 10 --sync-timeout 3.0 \
   --episodes 20 --max-cycles 0 \
   --initial-grasp-width 0.02 \
-  --trace-output "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze50_no_selector.jsonl" \
-  --results-csv "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze50_no_selector.csv" \
+  --trace-output "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze10_no_selector.jsonl" \
+  --results-csv "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze10_no_selector.csv" \
   --execute --confirm-real-robot
 ```
 
-**有 selector：动态执行 20–50 步。**
+**有 selector：动态执行 4–10 步。**
 
 ```bash
-/home/huiyuan/miniconda3/envs/pushbox/bin/python /home/huiyuan/teleoperation/maze_real/scripts/deployment/cartesian.py "/home/huiyuan/teleoperation/training_runs/planarp_chunks_20260914_165545/maze_planarp_chunk50/checkpoints/epoch_0009.pt" \
+/home/huiyuan/miniconda3/envs/pushbox/bin/python /home/huiyuan/teleoperation/maze_real/scripts/deployment/cartesian.py "/home/huiyuan/teleoperation/maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt" \
   --weights model --device cuda:0 \
   --calibration "/home/huiyuan/teleoperation/threading_real/calibration/block_grasp_spatial.json" \
-  --policy-hz 7.5 --execute-steps 50 --sync-timeout 10.0 \
-  --selector "/home/huiyuan/teleoperation/training_runs/maze_selector_H50_h20_progress_20260916_140818/model" \
+  --policy-hz 7.5 --execute-steps 10 --sync-timeout 3.0 \
+  --selector "/home/huiyuan/teleoperation/data/analysis/selector_eval_20260914_142324/models/maze_h4" \
   --episodes 20 --max-cycles 0 \
   --initial-grasp-width 0.02 \
-  --trace-output "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze50_selector_h20_progress.jsonl" \
-  --results-csv "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze50_selector_h20_progress.csv" \
+  --trace-output "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze10_selector_h4.jsonl" \
+  --results-csv "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze10_selector_h4.csv" \
   --execute --confirm-real-robot
 ```
 
-有 selector 时，实际执行步数由 selector 决定，`--execute-steps 50` 不会将动态输出固定为 50。
+有 selector 时，实际执行步数由 selector 决定，`--execute-steps 10` 不会将动态输出固定为 10。
+
+**AAC：动态执行 1–10 步，运动量阈值 0.04（4 厘米净位移）。**
+
+```bash
+/home/huiyuan/miniconda3/envs/pushbox/bin/python /home/huiyuan/teleoperation/maze_real/scripts/deployment/cartesian.py "/home/huiyuan/teleoperation/maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt" \
+  --weights model --device cuda:0 \
+  --calibration "/home/huiyuan/teleoperation/threading_real/calibration/block_grasp_spatial.json" \
+  --aac --aac-alpha 0.04 --aac-num-samples 20 --aac-execution-candidate-index 0 \
+  --policy-hz 7.5 --execute-steps 10 --sync-timeout 3.0 \
+  --episodes 20 --max-cycles 0 \
+  --initial-grasp-width 0.02 \
+  --trace-output "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze10_aac_alpha0p04_n20.jsonl" \
+  --results-csv "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze10_aac_alpha0p04_n20.csv" \
+  --execute --confirm-real-robot
+```
+
+AAC 不加载 selector checkpoint，不能同时传 `--selector`。保持完整 H10 预测，
+`--execute-steps 10` 不覆盖 AAC 的长度决定。Maze 只计算平面 XY 位移，Z、旋转和夹爪保持不变。
 
 ## Threading：每个条件 20 次
 
@@ -115,7 +140,7 @@ Maze 默认采用**手动 guide 切换确认**，不需要设置 `MAZE_GUIDE_ENT
 runner 停止后再手动进入 guide 复位。Threading runner 不会自动切换 guide。
 
 H20 在 7.5 Hz 下最长执行时间为 `20/7.5 ≈ 2.67 s`，超过默认同步超时 2 s。
-以下两组命令均显式使用 `--sync-timeout 5.0`，为执行和收敛等待留出余量。
+以下三组命令均显式使用 `--sync-timeout 5.0`，为执行和收敛等待留出余量。
 
 **无 selector：固定执行 20 步。**
 
@@ -148,13 +173,108 @@ H20 在 7.5 Hz 下最长执行时间为 `20/7.5 ≈ 2.67 s`，超过默认同步
   --execute --confirm-real-robot
 ```
 
+**AAC：允许执行 1–20 步，当前评估运动量阈值为 1。**
+
+```bash
+/home/huiyuan/miniconda3/envs/pushbox/bin/python /home/huiyuan/teleoperation/threading_real/scripts/deployment/cartesian.py "/home/huiyuan/teleoperation/training_runs/planarp_chunks_20260914_165545/threading_planarp_chunk20/checkpoints/epoch=0008-val_loss=10.981.ckpt" \
+  --weights model --device cuda:0 \
+  --pointcloud-calibration "/home/huiyuan/teleoperation/threading_real/calibration/block_grasp_spatial.json" \
+  --aac --aac-alpha 1 --aac-num-samples 20 --aac-execution-candidate-index 0 --aac-sample-batch-size 1 \
+  --policy-hz 7.5 --execute-steps 20 \
+  --prediction-mode full_then_truncate --synchronous --sync-timeout 5.0 \
+  --episodes 20 --max-cycles 0 \
+  --grasp-before-inference --initial-grasp-width 0.02 \
+  --trace-output "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/threading20_aac_1_n20.jsonl" \
+  --results-csv "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/threading20_aac_1_n20.csv" \
+  --execute --confirm-real-robot
+```
+
+AAC 不能同时传 `--chunk-selector`、`--execution-schedule` 或使用 `required_only`。
+这两条命令使用本页 ARP checkpoint，不是 pi0.5。无需训练 AAC 或额外视觉编码器。
+连续熵在预测出的物理动作增量上计算；Threading 夹爪宽度增量累计后转为二值状态。
+ARP 的空间预测随机采样开启，存在 `low_var_eval` 的模块在采样期间关闭该设置，随后恢复。
+
+Maze 使用 `alpha=0.04`，位移单位为米，阈值对应 4 厘米净位移；Threading 当前评估使用 `alpha=1`，平移使用米、旋转使用弧度，不做隐式单位换算。
+Maze 的 0.04 最初是离线筛选的实机测试起点：对已有 alpha=3 的 19 条预测离线重算，平均执行长度为 5 步，18/19 条达到阈值；这不是闭环实测结果，也不代表最优参数。
+若没有前缀达到运动量阈值，AAC 仍返回整个 horizon。详见 [AAC 熵边界与运动量分析](AAC_entropy_chunk_analysis.md)。
+trace 中记录 `xi`、`h_entropy`、`action_magnitude`、
+`magnitude_threshold_reached`、候选方差、生成步数及推理耗时，可核查这一行为。
+`generated_action_tokens` 沿用 AAC 命名，表示 `N*H` 个动作时间步，不是 ARP 内部空间 token 数。
+
+## AAC 评估结果（2026-09-18）
+
+以下按两份 CSV 当前保存的记录统计；成功标签为运行结束后的人工填写结果。Maze 为 20 条记录，Threading 为 11 条记录，后者尚未达到计划的 20 次。不同 alpha 不合并。
+
+| 任务 / 条件 | 计划次数 | 计入次数 | 中断失败数 | 成功数 | 失败数（含中断） | 成功率 | 成功平均耗时 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Maze H10 AAC（alpha=0.04，N=20） | 20 | 20 | 0 | 12 | 8 | 60.00% | 33.98 s |
+| Threading H20 AAC（alpha=1，N=20） | 20 | 11 | 1 | 3 | 8 | 27.27% | 22.21 s |
+
+统计口径与下文一致：有效 `completed` 加 `interrupted` 作分母，中断计失败；成功平均耗时仅取 `completed` 且 `success=1`。Threading episode 5 的原始 success 为空，统计时计失败，不修改 CSV；仅看已完成记录为 3/10（30.00%），不是本表主口径。Maze 编号缺少 17、19，但文件实际有 20 条记录，缺号不补成失败。CSV 不记录 alpha，参数由对应 JSONL 内部字段核对。
+
+### Maze AAC 原始结果
+
+来源：[maze10_aac_alpha0p04_n20.csv](../data/analysis/selector_eval_matched_20260916/logs/maze10_aac_alpha0p04_n20.csv)。保留原编号及六位小数耗时，截止 episode 22，开始时间 `2026-09-18T12:28:55.003286+00:00`。
+
+| 原始 episode | 耗时（s） | 原始 success | status |
+| ---: | ---: | --- | --- |
+| 1 | 43.776891 | 1 | completed |
+| 2 | 5.521730 | 0 | completed |
+| 3 | 40.765360 | 1 | completed |
+| 4 | 39.774481 | 1 | completed |
+| 5 | 33.772384 | 1 | completed |
+| 6 | 32.272268 | 1 | completed |
+| 7 | 7.216247 | 0 | completed |
+| 8 | 4.539695 | 0 | completed |
+| 9 | 6.999378 | 0 | completed |
+| 10 | 6.544708 | 0 | completed |
+| 11 | 28.135390 | 1 | completed |
+| 12 | 10.701615 | 0 | completed |
+| 13 | 9.721139 | 1 | completed |
+| 14 | 29.928839 | 1 | completed |
+| 15 | 6.827067 | 0 | completed |
+| 16 | 29.214910 | 0 | completed |
+| 18 | 33.919387 | 1 | completed |
+| 20 | 43.655307 | 1 | completed |
+| 21 | 33.841563 | 1 | completed |
+| 22 | 38.156292 | 1 | completed |
+
+### Threading AAC 原始结果
+
+来源：[threading20_aac_1_n20.csv](../data/analysis/selector_eval_matched_20260916/logs/threading20_aac_1_n20.csv)。截止 episode 11，开始时间 `2026-09-18T13:35:41.176359+00:00`。
+
+| 原始 episode | 耗时（s） | 原始 success | status |
+| ---: | ---: | --- | --- |
+| 1 | 30.622337 | 0 | completed |
+| 2 | 20.079235 | 0 | completed |
+| 3 | 21.694208 | 1 | completed |
+| 4 | 21.005494 | 0 | completed |
+| 5 | 2.149276 | 空值 | interrupted |
+| 6 | 22.173833 | 0 | completed |
+| 7 | 21.821717 | 1 | completed |
+| 8 | 30.438776 | 0 | completed |
+| 9 | 23.105389 | 1 | completed |
+| 10 | 7.090734 | 0 | completed |
+| 11 | 21.641451 | 0 | completed |
+
+### 对应 trace 的执行长度快照
+
+| 条件 | 已执行决策数 | 平均 / 中位步数 | 执行完整 horizon | 阈值不可达 |
+| --- | ---: | --- | --- | --- |
+| Maze alpha=0.04 | 394 | 4.77 / 5 | 2/394（0.5%） | 1/394 |
+| Threading alpha=1 | 39 | 18.31 / 20 | 33/39（84.6%） | 33/39 |
+
+Maze [JSONL](../data/analysis/selector_eval_matched_20260916/logs/maze10_aac_alpha0p04_n20.jsonl) 截止时间戳 `1789734553.1790714`；Threading [JSONL](../data/analysis/selector_eval_matched_20260916/logs/threading20_aac_1_n20.jsonl) 截止 `1789738560.8201094`。Threading 共 40 条 trace，其中 1 条 `unsafe_raw_action`、`executed=false`，不计入上述执行分布；该条检查报告候选第 18 步原始旋转 1.8614 rad，并非实际执行角度。决策数和 CSV 的 episode 数不是同一统计单位。
+
+本节仅登记实测数据。参数选择、动作表现及方法局限见 [AAC 分析](AAC_entropy_chunk_analysis.md)。历史基线不具有 CSV 层面的配对起始条件标识，不能把组间差异解释为 AAC 的因果效果。
+
 ## 评估与记录
 
 每轮从开始推理计时，统一给 60 秒完成任务；达到成功条件、明显失败或超时后按 Enter 结束。
 60 秒需人工计时，当前命令不自动执行时限判断；`--max-cycles 0` 表示不限制推理轮数。
-不使用相同的最大推理轮数作时限，因为两种执行长度对应的实际时长不同。
+不使用相同的最大推理轮数作时限，因为不同方法的执行长度及推理开销不同。
 
-成功条件在第一轮前固定，两组一致：Maze 完成迷宫路径并到达预先指定的目标位置；Threading
+成功条件在第一轮前固定，三组一致：Maze 完成迷宫路径并到达预先指定的目标位置；Threading
 完成预先约定的穿线终态。开始后的人工辅助、卡住、物体脱落、超时或动作检查中止记为失败，
 并记录原因。不能把 selector 判为精细区当作任务成功，也不能把模型的验证准确率当成功率。
 
@@ -171,7 +291,7 @@ Maze 填写结果后才进入 guide 确认。每次保存后显示已评估次�
 平均耗时仅统计 `completed` 且 `success=1` 的尝试。部署终端现有统计仍使用旧口径，可能与本报告不同。
 没有成功样本时显示“暂无成功样本”，不记为 0 秒。CSV 保留每次尝试的原始耗时，失败耗时不参与平均值。
 
-四条命令的 `--results-csv` 分别指定四个 CSV 文件名。同名文件会读取历史记录并继续写入，
+六条命令的 `--results-csv` 分别指定六个 CSV 文件名。同名文件会读取历史记录并继续写入，
 CSV 编号从已有最大编号加 1 开始，统计包含历史完整记录。补跑时沿用同一名字，
 `--episodes` 指定本次新增尝试数（例如已有 8 次，再运行 `--episodes 12`）。
 文件中的任务、selector 条件和真机/诊断模式必须与当前命令一致。
@@ -324,7 +444,7 @@ Threading 无 selector 按用户指定排除 episode 18，仅统计其余 20 条
 | Threading H20（新 selector） | 45.00% → 65.00% | +20.00 个百分点 | 14.96 s → 17.60 s（+2.65 s） |
 
 Maze selector 的 episode 18 成功耗时为 57.502379 s，按原记录保留在均值中，未剔除。
-以上 Maze 结果属于 H10，不能填入 H50 的结果。耗时仅比较各组成功样本，不是全部尝试的平均差。
+以上 Maze 结果属于 H10，与本页默认 horizon 一致；旧 H50 数据单独保留。耗时仅比较各组成功样本，不是全部尝试的平均差。
 无 selector 基线来自早前运行；CSV 没有 checkpoint 或起始条件配对标识，因此只报告观察到的组间差异，
 不由 CSV 推断模型版本和起始条件完全一致。下方旧 Threading selector 与本次重训版本单独列示。
 

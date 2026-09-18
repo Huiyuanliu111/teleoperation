@@ -1,31 +1,63 @@
-> 本文的 h3/h4、H10 和 spatial rule 命令为历史实验。当前 H20/H50 配对模型部署见 [deploy_selector.md](deploy_selector.md)。
-> 2026-09-16 标签目录整理后，已迁移标签从 `data/datasets/selector/` 读取，可视化仍输出到 `data/analysis/`。
+> 按 2026-09-18 的代码和已保存模型配置核对。当前默认部署为 Threading H20 / h8 与 Maze H10 / h4，完整命令见 [deploy_selector.md](deploy_selector.md)。
+> 已迁移的历史空间标签位于 `data/datasets/selector/`；当前 Threading 路程标签保存在对应 `training_runs/` 运行目录，可视化和评估路径见下文。
 
-chunk selector标数据：称作spatial rule。
-按照训练集任务轨迹，按照TCP的3D位置轨迹划分不同的任务阶段。
-Threading real划分两段任务：第一个是非精细区，第二个是精细区。目前使用前50%后50%
-maze任务是先精细区后非精细区。比较好的是前30%后70%。精细区的空间范围较小，非精细区的空间范围较大。
+Chunk selector 使用 TCP 轨迹构造离线 soft label，精细阶段对应短 chunk `h`，非精细阶段对应长 chunk `H`。
+当前有两种标签规则，不能统一称作 spatial rule：
 
-标注数据使用soft label。给予可能性。
-精细区标h，非精细区标H。
-两个任务当前统一使用 h=4、H=10。
+| 项目 | Threading 当前部署 | Maze 当前部署 |
+| --- | --- | --- |
+| 动作模型 horizon | 20 | 10 |
+| 执行范围 | 8–20 步 | 4–10 步 |
+| 标签来源 | `progress_rule`，逐帧按累计路程进度标注 | `spatial_rule`，按 TCP 到球心的距离标注 |
+| 阶段顺序 | 先粗后细，50% 路程为过渡中心 | 先细后粗，用 30% 路程节点拟合球形边界 |
+| 过渡带 | 45–55% 路程，即完整宽度 0.1 | 球形边界内外完整宽度 2 cm |
+| 权重来源 | 配对 H20 MVT 编码器重新提取特征并重训 | 历史 h3/H10 概率权重重映射为 h4/H10 |
 
-标注好数据以后，我需要可视化chunk分布，以及节点对应的视频帧。
+两个任务均以点云为输入，提取冻结的 ARP MVT 编码器输出的空间 token，交给 Transformer
+预测两个概率。令精细区概率为 `p_fine`，连续期望为 `c = h*p_fine + H*(1-p_fine)`，
+执行步数为 `floor(c+0.5)`，可以取 `h…H` 的任意整数。TCP、速度、进度和动作不作为 selector 的在线输入。
 
+## 当前 Threading：累计路程标签（arc_length_progress_v1）
 
-用于预测的神经网络，直接提取arp的视觉编码器MVT输出的特征。这里是点云。
-使用一个transformer预测chunk。输出chunk可以是h~H之间的整数。
+实现见 [`progress_rule.py`](../threading_real/chunk_selector/progress_rule.py) 和
+[`label_progress.py`](../threading_real/scripts/chunk_selector/label_progress.py)。
+每条完整轨迹独立计算 TCP 3D 累计路程进度 `s`，当前模型使用：
 
-## 当前实现（spatial_rule_v1）
+```text
+p_fine = clip(0.5 + (s - 0.5) / 0.1, 0, 1)
+soft_label = [p_fine, 1-p_fine]
+c = 8*p_fine + 20*(1-p_fine)
+execution_steps = floor(c + 0.5)
+```
 
-百分比默认按 TCP 3D **累计路程**计算，可通过 `--progress-mode frames` 改为帧数进度。
-当前默认 `h=4`、`H=10`；两个任务部署输出均为 4–10 步。
-Threading 使用 50% 节点、Maze 使用 30% 节点。已有权重是在 h=3 下训练的精细区概率模型；
-当前部署将概率映射改为 `c = 4*p_fine + 10*(1-p_fine)`，取 `floor(c+0.5)`。
-概率标签不依赖 h，因此无需重训。h4 部署快照及命令见 [deploy_selector.md](deploy_selector.md)。
-60%、70%、80% 的结果保留用于历史对照。
+因此 0–45% 为粗区，45–55% 线性过渡，55–100% 为细区。这里直接按进度生成标签，
+不拟合球心或半径；同一 TCP 位置可能因所在轨迹或进度不同而得到不同标签。
+`progress_rule` 仅支持累计路程，不提供帧数进度选项。完整轨迹仅用于离线监督，在线由视觉预测概率。
 
-当前 spatial rule 用球形区域描述精细区，与已有 endpoint schedule 的空间定义一致：
+当前使用的文件：
+
+- [标签与规则](../training_runs/threading_selector_H20_h8_progress_20260916_134300/labels/summary.json)：80 条轨迹、11,273 帧，64 条训练 / 16 条验证，seed=42。
+- [模型配置](../training_runs/threading_selector_H20_h8_progress_20260916_134300/model/chunk_selector_config.json)：候选 `[8,20]`，`label_source=progress_rule`，匹配 H20 epoch 8 编码器及其 SHA-256。
+- [完整提取、训练与验证命令](../training_runs/threading_selector_H20_h8_progress_20260916_134300/run_config.json)。
+- [运行状态](../training_runs/threading_selector_H20_h8_progress_20260916_134300/status.json)：按用户要求停止，完成 11 个 epoch，最佳 epoch 11，停止后验证已完成。
+
+训练细节见 [Selector_H20_progress_training.md](Selector_H20_progress_training.md)。模型输入保留全部
+1,800×128 token，无池化。更换动作模型的 MVT 编码器后，不能仅修改候选长度就认为旧 selector 仍然匹配；
+当前 Threading 已使用配对编码器重新提取特征并重训。
+
+## 当前 Maze 与历史 Threading：空间标签（spatial_rule_v1）
+
+实现见 [`spatial_rule.py`](../threading_real/chunk_selector/spatial_rule.py)。`label_spatial.py`
+默认 `h=4`、固定 `H=10`，允许 h 为 3、4、5；这不是两个任务当前部署的统一配置。
+百分比默认按 TCP 3D 累计路程计算，可通过 `--progress-mode frames` 改为帧数进度。
+未指定 `--split-progress` 时，脚本默认 Threading 0.8、Maze 0.3；历史 Threading p50 实验显式传入 0.5。
+
+Maze 当前使用 [maze_h4 模型配置](../data/analysis/selector_eval_20260914_142324/models/maze_h4/chunk_selector_config.json)，
+由历史 h3/H10 概率权重重映射为 h4/H10，执行 `floor(4*p_fine + 10*(1-p_fine) + 0.5)`。
+仅在标签规则和视觉编码器保持一致、只调整输出映射时，才可利用概率标签不依赖 h 的性质而无需重训。
+Threading 的 p50、p60、p70、p80 空间规则结果均作为历史对照。
+
+spatial rule 用球形区域描述精细区：
 
 1. 按 episode 划分训练和验证集（默认 seed=42，验证占 20%）。
 2. 仅从训练轨迹取中心：Threading 取末端 TCP 位置的逐坐标中位数，Maze 取起始 TCP 位置的逐坐标中位数。
@@ -35,12 +67,12 @@ Threading 使用 50% 节点、Maze 使用 30% 节点。已有权重是在 h=3 �
 5. soft label 为 `[p_fine, 1-p_fine]`，对应 `[h,H]`。连续期望为
    `c = h*p_fine + H*(1-p_fine)`；执行步数为 `floor(c+0.5)`。
 
-因此分界位置处为 `[0.5,0.5]`。空间规则对所有 episode 相同：同一 TCP 位置得到同一标签，
+因此球形分界位置处为 `[0.5,0.5]`。对于同一套已拟合的空间规则，所有 episode 共用该规则：同一 TCP 位置得到同一标签，
 不使用速度、全局分位排名或 fine 状态锁定。进度只用于拟合空间区域，并非逐帧按进度打标签。
-球形边界是当前可解释的基线；若可视化发现轨迹绕行、多个任务阶段重叠或起点分布过宽，
+上述性质仅适用于 spatial rule，不适用于当前 Threading 的 progress rule。球形边界是空间标注基线；若可视化发现轨迹绕行、多个任务阶段重叠或起点分布过宽，
 应调整区域形状，而非假定一个球总能准确代表任务阶段。
 
-**路程比例不等于帧数比例。** 当前 Threading 80% 路程分界得到的精细区平均约占每条轨迹
+**路程比例不等于帧数比例。** 历史 Threading spatial rule 的 80% 路程分界得到的精细区平均约占每条轨迹
 32% 的帧。报告同时标出进度节点和实际空间边界的穿越节点，可能不在同一帧。
 
 ## 归一化进度：50%、60%、70% 是怎样计算的
@@ -74,7 +106,7 @@ Threading 使用 50% 节点、Maze 使用 30% 节点。已有权重是在 h=3 �
 路程；位置不变的暂停不增加路程，折返则仍然增加路程。它也不是起点到当前位置的直线距离。
 当前只计算 TCP 的平移，不计旋转和夹爪开合；位置噪声和采样疏密会影响计算结果。
 
-选取 70% 节点时，先找到累计路程达到 `总路程 × 0.7` 的位置。若该位置在两个观测之间，
+对于 spatial rule，选取 70% 节点时，先找到累计路程达到 `总路程 × 0.7` 的位置。若该位置在两个观测之间，
 用两点之间的线性插值确定空间节点；**导出截图时，则选进度最接近 70% 的实际帧**，
 所以截图可能显示 70.01%，而不是恰好 70%。
 
@@ -87,14 +119,35 @@ Threading 使用 50% 节点、Maze 使用 30% 节点。已有权重是在 h=3 �
 | 70% | 87 | 70.01% |
 | 80% | 102 | 80.20% |
 
-这些百分比节点用于估计精细区的空间范围；最终标签按 TCP 到精细区中心的距离生成。
+在 spatial rule 中，这些百分比节点用于估计精细区的空间范围；最终标签按 TCP 到精细区中心的距离生成。
 因此，“70% 路程节点”不保证正好是进入精细区的那一帧，也不保证精细区占最后 30% 的帧。
 
-## 标注与可视化
+## 当前 Threading 路程标签的生成与可视化
+
+以下命令从仓库根目录、在 conda `arp` 环境中运行，输出到新的复现目录；不会修改当前部署模型：
+
+```bash
+python threading_real/scripts/chunk_selector/label_progress.py \
+  data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5 \
+  --task threading --h 8 --H 20 --split-progress 0.5 --transition-width 0.1 \
+  --previous-labels data/datasets/selector/threading_spatial_h3_p50 \
+  --seed 42 --val-ratio 0.2 \
+  --output data/datasets/selector/threading_progress_h8_H20_p50_repro
+```
+
+`--previous-labels` 用于核验旧标签的 episode 划分与逐帧 TCP，并记录标签变化，不决定新标签概率。
+输出目录必须不存在。脚本生成 `labels.parquet`、`summary.json` 和 `labels_by_arc_length.png`。
+已有训练结果的验证曲线为
+[validation_chunks_by_arc_length.png](../training_runs/threading_selector_H20_h8_progress_20260916_134300/model/validation_chunks_by_arc_length.png)，
+验证指标和逐帧预测也保存在同一模型目录。`evaluate_progress.py` 的实际调用见上面的运行配置。
+`visualize_spatial.py` 依赖球形规则字段，不能直接用于 progress_rule 标签。
+
+## 空间标签的标注与可视化（历史复现实例）
 
 以下命令从 `/home/huiyuan/teleoperation` 运行，使用包含 NumPy、SciPy、PyArrow、
 HDF5、OpenCV、Matplotlib、PyTorch 和 ARP 依赖的环境（本机为 conda `arp`）。
-输出目录必须不存在，脚本不会覆盖已有结果。
+输出目录必须不存在，脚本不会覆盖已有结果。以下 h4 空间标签示例不复现当前 Threading 模型，
+也不代表 Maze 当前快照曾以 h4 重新训练。
 
 ```bash
 python threading_real/scripts/chunk_selector/label_spatial.py \
@@ -131,9 +184,13 @@ python threading_real/scripts/chunk_selector/visualize_spatial.py \
 
 ## ARP MVT 特征 → Transformer selector
 
-两个任务共用 `threading_real/scripts/chunk_selector/` 的 spatial 标注、特征缓存与训练工具。
+两个任务共用 `threading_real/scripts/chunk_selector/` 的特征缓存与训练工具，
+分别使用 `label_progress.py` 或 `label_spatial.py` 生成监督。
 点云经过已训练并冻结的 ARP MVT 编码器，直接取其输出的空间 token；不向 selector 输入
 TCP、速度、进度或动作。TCP 只用于离线构造监督。
+
+以下是与上一节 h4 空间标签配套的历史训练示例。当前 Threading H20 的准确提取、训练命令见
+[run_config.json](../training_runs/threading_selector_H20_h8_progress_20260916_134300/run_config.json)。
 
 ```bash
 python threading_real/scripts/chunk_selector/extract_mvt_features.py \
@@ -165,9 +222,9 @@ python threading_real/scripts/chunk_selector/train.py \
 如需减少显存和缓存体积，可在提取时显式添加 `--pool-grid 4`，将每个虚拟视角池化到
 4×4，得到 32 个 token；该设置写入 checkpoint，部署使用相同处理。
 
-训练检测到 `label_source=spatial_rule` 后自动启用概率交叉熵和 `selection_mode=expected`，
-并沿用拟合区域时的训练/验证 episode 划分。神经网络输出两个概率，最终执行步数可以是
-`h…10` 的任意整数，不局限于 h 和 10。以验证集 soft-label loss 选择 checkpoint，
+训练检测到 `label_source` 为 `spatial_rule` 或 `progress_rule` 后自动启用概率交叉熵和
+`selection_mode=expected`，并沿用标签中保存的训练/验证 episode 划分。神经网络输出两个概率，最终执行步数可以是
+`h…H` 的任意整数，不局限于两个端点。以验证集 soft-label loss 选择 checkpoint，
 同时记录连续 chunk MAE。更好的标签可学性与真实任务成功率仍需训练和实验验证。
 
 ## 推理接入
@@ -178,11 +235,14 @@ Threading MVT 当前使用 `--prediction-mode full_then_truncate`，不可同时
 `--execution-schedule`。原始预测经过 runner 现有检查和裁剪后再执行所选前缀。
 
 当前可用的模型配对、完整路径和部署命令统一见 [deploy_selector.md](deploy_selector.md)。
-`selector_eval_20260914_142324` 保留 H10 历史模型与评估记录；使用时须配对原 H10 编码器。
+`selector_eval_20260914_142324` 保留 H10 模型与评估记录，其中 `models/maze_h4` 仍是当前
+Maze 默认 selector，须配对原 H10 编码器。Threading 使用上述 H20 progress 模型。
+AAC 是 runner 的另一种自适应执行长度方式，不加载 learned selector，不能与 selector 同时启用；
+其部署命令和评估另见部署文档。
 
 ## 直接导出 PNG（无需 HTML）
 
-新增 `threading_real/scripts/chunk_selector/export_spatial_frames.py`。每个节点及相邻帧
+`threading_real/scripts/chunk_selector/export_spatial_frames.py` 用于导出节点帧。以下为空间标签示例。每个节点及相邻帧
 单独保存为 PNG，并按 episode 输出 `episode_XXXXXX_overview.png` 拼图。
 `frames.json` 记录来源、数据行号、原视频帧号和节点类型。
 
@@ -208,7 +268,8 @@ python threading_real/scripts/chunk_selector/export_spatial_frames.py \
 
 ## 历史 h3 后台训练（2026-09-14）
 
-已启动两个独立的“特征提取 → 完整性检查 → selector 训练”后台任务。
+两个独立的“特征提取 → 完整性检查 → selector 训练”后台任务均已完成，
+各自 `status.json` 的 `state` 为 `complete`；本节记录历史配置。
 Threading 使用 50% 节点（64 条训练 / 16 条验证）；Maze 使用 30% 节点
 （39 条训练 / 10 条验证）。两者均为 h=3、H=10、2 cm 过渡带、seed=42。
 
@@ -217,8 +278,8 @@ Selector 使用 2 层 Transformer、隐藏维度 256、4 个注意力头、前�
 AdamW 学习率 1e-4，最多 100 个 epoch，验证损失连续 15 个 epoch 不改善则早停。
 使用概率交叉熵监督和期望取整输出，按最低验证损失保存模型。
 
-- **threading**：[运行配置](../threading_real/outputs/selector_spatial_h3_p50_20260914_135535/run_config.json)、[状态](../threading_real/outputs/selector_spatial_h3_p50_20260914_135535/status.json)、[特征提取日志](../threading_real/outputs/selector_spatial_h3_p50_20260914_135535/extract.log)。训练开始后同目录生成 `train.log`，最佳模型保存为 `chunk_selector.safetensors`。
-- **maze**：[运行配置](../maze_real/outputs/selector_spatial_h3_p30_20260914_135535/run_config.json)、[状态](../maze_real/outputs/selector_spatial_h3_p30_20260914_135535/status.json)、[特征提取日志](../maze_real/outputs/selector_spatial_h3_p30_20260914_135535/extract.log)。训练开始后同目录生成 `train.log`，最佳模型保存为 `chunk_selector.safetensors`。
+- **threading**：[运行配置](../threading_real/outputs/selector_spatial_h3_p50_20260914_135535/run_config.json)、[状态](../threading_real/outputs/selector_spatial_h3_p50_20260914_135535/status.json)、[特征提取日志](../threading_real/outputs/selector_spatial_h3_p50_20260914_135535/extract.log)。同目录已生成 `train.log`，最佳模型保存为 `chunk_selector.safetensors`。
+- **maze**：[运行配置](../maze_real/outputs/selector_spatial_h3_p30_20260914_135535/run_config.json)、[状态](../maze_real/outputs/selector_spatial_h3_p30_20260914_135535/status.json)、[特征提取日志](../maze_real/outputs/selector_spatial_h3_p30_20260914_135535/extract.log)。同目录已生成 `train.log`，最佳模型保存为 `chunk_selector.safetensors`。
 
 每个 `run_config.json` 保存准确的 checkpoint 路径及 SHA-256、标注规则、数据划分和完整命令。
 `status.json` 区分 `extract_running`、`train_running`、`complete`、`failed`，特征未提取完成时
