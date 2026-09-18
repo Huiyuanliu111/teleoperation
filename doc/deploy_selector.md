@@ -208,7 +208,7 @@ trace 中记录 `xi`、`h_entropy`、`action_magnitude`、
 | 任务 / 条件 | 计划次数 | 计入次数 | 中断失败数 | 成功数 | 失败数（含中断） | 成功率 | 成功平均耗时 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Maze H10 AAC（alpha=0.04，N=20） | 20 | 20 | 0 | 12 | 8 | 60.00% | 33.98 s |
-| Threading H20 AAC（alpha=1，N=20） | 20 | 11 | 1 | 3 | 8 | 27.27% | 22.21 s |
+| Threading H20 AAC（alpha=1，N=20） | 20 | 11 | 1 | 3 | 8 | 30% | 22.21 s |
 
 统计口径与下文一致：有效 `completed` 加 `interrupted` 作分母，中断计失败；成功平均耗时仅取 `completed` 且 `success=1`。Threading episode 5 的原始 success 为空，统计时计失败，不修改 CSV；仅看已完成记录为 3/10（30.00%），不是本表主口径。Maze 编号缺少 17、19，但文件实际有 20 条记录，缺号不补成失败。CSV 不记录 alpha，参数由对应 JSONL 内部字段核对。
 
