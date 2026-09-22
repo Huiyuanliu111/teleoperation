@@ -974,15 +974,64 @@ class TrackCStreamer:
         self.thread = None
         self.started = False
         self.closed = False
+        self._diagnostics_lock = threading.Lock()
+        self._last_send_seq = None
+        self._last_send_monotonic_s = None
+        self._last_sent_target_T = None
+        self._successful_send_count = 0
+        self._send_error = None
 
     def _send_packet(self, T_ref):
-        T_ref = _as_pose_matrix(T_ref).reshape(-1)
+        target = _as_pose_matrix(T_ref)
+        seq = int(next(self.seq_counter))
         packet = struct.pack(
             TRACKC_PACKET_FORMAT,
-            int(next(self.seq_counter)),
-            *[float(x) for x in T_ref],
+            seq,
+            *[float(x) for x in target.reshape(-1)],
         )
         self.sock.sendto(packet, self.command_addr)
+        sent_at = time.monotonic()
+        with self._diagnostics_lock:
+            self._last_send_seq = seq
+            self._last_send_monotonic_s = sent_at
+            self._last_sent_target_T = target
+            self._successful_send_count += 1
+
+    def get_diagnostics(self):
+        """Read local sender telemetry; sendto success does not confirm receipt.
+
+        Sender and manager snapshots use separate locks and are not jointly
+        atomic. The manager target is scheduled, potentially not yet sent.
+        Monotonic timestamps are only comparable on this host.
+        """
+        with self._diagnostics_lock:
+            result = {
+                "last_send_seq": self._last_send_seq,
+                "last_send_monotonic_s": self._last_send_monotonic_s,
+                "last_sent_target_T": (
+                    None if self._last_sent_target_T is None
+                    else self._last_sent_target_T.tolist()
+                ),
+                "successful_send_count": self._successful_send_count,
+                "send_error": None if self._send_error is None else dict(self._send_error),
+            }
+        with self.manager.lock:
+            result["manager"] = {
+                "index": self.manager.index,
+                "length": len(self.manager.active_trajectory),
+                "completed": self.manager.completed,
+                "scheduled_target_T": (
+                    None if self.manager.last_sent_T is None
+                    else self.manager.last_sent_T.tolist()
+                ),
+            }
+        sender_thread = self.thread
+        result.update(
+            snapshot_monotonic_s=time.monotonic(),
+            sender_thread_alive=sender_thread is not None and sender_thread.is_alive(),
+            running=self.running.is_set(),
+        )
+        return result
 
     def start(self, T_start, stiffness, nullspace_stiffness=1.0):
         if self.closed:
@@ -1018,21 +1067,30 @@ class TrackCStreamer:
         )
 
     def _send_loop(self):
-        period = 1.0 / self.stream_hz
-        next_time = time.perf_counter()
+        try:
+            period = 1.0 / self.stream_hz
+            next_time = time.perf_counter()
 
-        while self.running.is_set():
-            _, T_ref = self.manager.next_sample()
-            if T_ref is not None:
-                self._send_packet(T_ref)
+            while self.running.is_set():
+                _, T_ref = self.manager.next_sample()
+                if T_ref is not None:
+                    self._send_packet(T_ref)
 
-            next_time += period
-            sleep_time = next_time - time.perf_counter()
+                next_time += period
+                sleep_time = next_time - time.perf_counter()
 
-            if sleep_time > 0.0:
-                time.sleep(sleep_time)
-            else:
-                next_time = time.perf_counter()
+                if sleep_time > 0.0:
+                    time.sleep(sleep_time)
+                else:
+                    next_time = time.perf_counter()
+        except Exception as exc:
+            with self._diagnostics_lock:
+                self._send_error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "monotonic_s": time.monotonic(),
+                }
+            raise
 
     def _request_server_stop(self):
         if self.started:

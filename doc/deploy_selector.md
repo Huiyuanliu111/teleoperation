@@ -1,19 +1,56 @@
 # Selector 对照实验部署
 
+## 实验结果总表（2026-09-22 更新）
+
+每轮执行超时：Threading 默认 **30s**，Maze 默认 **50s**，可用 `--episode-timeout` 覆盖。
+从开始推理计时，不包含初始夹取、场景复位和结果填写。超时自动停止本轮并保存视频，
+CSV 记录 `status=timeout`、`success=0`，不再询问结果。动作等待期间及下发动作前检查时限；
+正在执行的相机读取或模型推理返回后才会处理超时，实际停止可能晚于设定值。
+这是 episode 总时限；`--sync-timeout` 仍是单个动作段的等待时限。
+以下历史结果未因新增时限重新计算；后续统计应将 `timeout` 计为失败。
+
+按原始 CSV 统计，条件名称链接到数据来源；计入次数为有效 `completed` 加 `interrupted`，中断计失败。
+成功平均耗时只统计 `completed` 且 `success=1`；`—` 表示暂无结果。
+
+| 任务 / 条件 | 计入 / 计划次数 | 中断失败数 | 成功数 | 失败数（含中断） | 成功率 | 成功平均耗时 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| [Maze H10 无 selector（固定 10 步）](../data/analysis/selector_eval_20260914_142324/logs/maze_no_selector.csv) | 20/20 | 2 | 13 | 7 | 65.00% | 11.68 s |
+| [Maze H10 selector（4–10 步）](../data/analysis/selector_eval_20260914_142324/logs/maze10_selector_h4.csv) | 20/20 | 0 | 15 | 5 | 75.00% | 18.81 s |
+| [Maze H10 AAC（α=0.04，N=20）](../data/analysis/selector_eval_matched_20260916/logs/maze10_aac_alpha0p04_n20.csv) | 20/20 | 0 | 12 | 8 | 60.00% | 33.98 s |
+| [Maze H10 AutoHorizon](../data/analysis/selector_eval_matched_20260916/logs/maze10_autohorizon_bidir.csv) | 20/20 | 0 | 12 | 8 | 60.00% | 16.22 s |
+| [Threading H20 无 selector（固定 20 步）](../data/analysis/selector_eval_chunks_20260916/logs/threading20_no_selector.csv) | 20/20 | 0 | 9 | 11 | 45.00% | 14.96 s |
+| [Threading H20 新 selector（8–20 步）](../data/analysis/selector_eval_matched_20260916/logs/threading20_selector_h8_progress.csv) | 20/20 | 0 | 13 | 7 | 65.00% | 17.60 s |
+| [Threading H20 AAC（α=1，N=20）](../data/analysis/selector_eval_matched_20260916/logs/threading20_aac_1_n20.csv) | 11/20 | 1 | 3 | 8 | 27.27% | 22.21 s |
+| [Threading H20 AutoHorizon（实测均为 20 步）](../data/analysis/selector_eval_matched_20260916/logs/threading20_autohorizon_bidir.csv) | 10/20 | 0 | 3 | 7 | 30.00% | 14.24 s |
+
+Threading 无 selector 按此前约定排除 episode 18；其余组不额外排除记录。
+Threading AAC 为 3/11（27.27%）；原文 30% 是仅计 10 条 completed 的结果，现统一计入中断。
+Maze AutoHorizon CSV 有 20 次 completed，编号为 1–19、21；缺号不补成失败，成功平均耗时统计 12 次成功尝试。
+Threading AutoHorizon CSV 有 10 次尝试，episode 1 标记失败且无对应动作 trace，仍计入失败；另 9 次尝试共 36 次决策。
+AAC 和 AutoHorizon 未满 20 次的组为阶段性结果。历史基线缺少配对起始条件标识，且 AAC 使用随机多候选采样，组间差异不能解释为纯执行长度的因果效果。
+
+## 部署与实验设置
+
+服务器推理、相机留在本机的独立入口见 [OpenPI 远程推理部署](deploy_pi05_openpi_remote.md)。
+
+π0.5 OpenPI 的独立固定长度部署见 [Threading OpenPI：no selector](deploy_pi05_openpi.md)（本机 4060 Ti，2000 步权重，30 Hz，H50，默认固定执行 50 步）。
+
 本页默认与已有结果保持一致：Maze 使用 H10 策略及历史 h4 selector 快照；Threading 使用 H20 策略及 2026-09-16 重训的 h8 selector。
 Maze 比较 **固定 10 步** 与 **动态 4–10 步**；Threading 比较 **固定 20 步** 与 **动态 8–20 步**。
 新增 AAC 条件（2026-09-18）：Maze 运动量阈值 `alpha=0.04`，Threading 当前评估使用 `alpha=1`；均使用 `N=20`、执行候选 0。
-每个条件评估 20 次，即每个任务 60 次，两个任务共 120 次。每个任务使用同一套 20 个起始条件，
-第 i 次在三种方法下尽量复现相同的物体、起始位姿和目标位置。
+每个条件评估 20 次；加入两个任务的 AutoHorizon 后，Maze 和 Threading 各 80 次，总计 160 次。
+每个任务使用同一套 20 个起始条件，第 i 次在各方法下尽量复现相同的物体、起始位姿和目标位置。
 
 | 任务 | 条件 | 执行步数 | 归一化节点 | 评估次数 |
 | --- | --- | --- | --- | --- |
 | Maze | no selector | 固定 10 | 不使用 | 20 |
 | Maze | selector | 4–10 | 历史空间规则，先细后粗 | 20 |
 | Maze | AAC | 1–10 | 动作熵 + 最小运动量，不使用路程标签 | 20 |
+| Maze | AutoHorizon | 1–10 | 动作 self-attention，不使用路程标签 | 20 |
 | Threading | no selector | 固定 20 | 不使用 | 20 |
 | Threading | selector | 8–20 | 路程 50%，先粗后细 | 20 |
 | Threading | AAC | 1–20 | 动作熵 + 最小运动量，不使用路程标签 | 20 |
+| Threading | AutoHorizon | 1–20 | 动作 self-attention，不使用路程标签 | 20 |
 
 Maze 两组均生成完整 10 步预测，Threading 两组均生成完整 20 步预测，再执行指定长度的前缀。同一任务使用相同的 ARP checkpoint、
 `model` 权重、7.5 Hz 控制频率、相机标定及动作限制，仅改变执行长度是否由 selector 决定。
@@ -21,6 +58,8 @@ Maze 两组均生成完整 10 步预测，Threading 两组均生成完整 20 步
 上述“仅改变执行长度”适用于固定长度与 learned selector 两组。AAC 则启用 ARP 随机采样，
 每次共享一次视觉编码，生成 20 条完整预测（Threading 默认每批 1 条），用候选 0 同时计算运动量并执行其前缀；
 因此 AAC 与原确定性基线还存在采样方式及推理开销的差异，不能解释为纯执行长度消融。
+
+Threading AutoHorizon 部署见下方专节，使用与主实验相同的 H20、chunk=20、epoch 8 checkpoint，单独记录日志。
 
 ## 本次模型版本
 
@@ -48,7 +87,7 @@ Threading 训练记录：[Selector_H20_progress_training.md](Selector_H20_progre
 
 ## 运行环境
 
-下面六组部署命令均使用完整路径，可单独复制，不依赖 `MAZE_ARP` 等 shell 变量。
+下面部署命令均使用完整路径，可单独复制，不依赖 `MAZE_ARP` 等 shell 变量。
 在交互式终端中运行以下准备命令。部署使用 `pushbox` 环境：本机该环境具备 Pinocchio 和
 RealSense 依赖，训练使用的 `arp` 环境缺少这两个部署依赖。
 
@@ -60,8 +99,8 @@ conda activate pushbox
 mkdir -p "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs"
 ```
 
-下面六条命令包含 `--execute --confirm-real-robot`，运行后会在每轮按 Enter 开始时执行真实动作。
-六个条件依次运行，共用机器人和相机，不能同时启动。
+下面实机命令包含 `--execute --confirm-real-robot`，运行后会在每轮按 Enter 开始时执行真实动作。
+各条件依次运行，共用机器人和相机，不能同时启动。
 
 ## Maze：每个条件 20 次
 
@@ -76,10 +115,7 @@ Z 始终等于该固定值，不随实测高度更新。下一轮复位、夹取
 Maze 默认采用**手动 guide 切换确认**，不需要设置 `MAZE_GUIDE_ENTER`、
 `MAZE_GUIDE_EXIT` 或传入两个 `--guide-*-command` 参数。每轮停止运动后，程序提示在
 机器人界面启用 guide，完成后按 Enter 确认；下一轮启动前再提示退出 guide 并确认。
-手动确认没有 30 秒超时，可以按 Ctrl+C 退出。程序本身不会通过 RPC 自动切换 guide。
 
-如果已有实际控制 guide 的外部命令，仍可通过 `--guide-enter-command` 和
-`--guide-exit-command` 指定；外部命令保留 30 秒超时。
 
 第一轮开始前自行确认机器人已退出 guide。每轮结束时 runner 停止运动，再提示进入 guide。
 手动复位后，在主终端按 Enter 准备下一轮，按提示退出 guide 并确认；随后自动夹取并开始推理。
@@ -133,6 +169,30 @@ Maze 默认采用**手动 guide 切换确认**，不需要设置 `MAZE_GUIDE_ENT
 
 AAC 不加载 selector checkpoint，不能同时传 `--selector`。保持完整 H10 预测，
 `--execute-steps 10` 不覆盖 AAC 的长度决定。Maze 只计算平面 XY 位移，Z、旋转和夹爪保持不变。
+
+**AutoHorizon：动态执行 1–10 步。**
+
+已核验主实验 `epoch_0209.pt` 的 `horizon=10`、`action_chunk_size=10`、`plan_steps=4`。
+每次在同一动作组中生成完整 10 步；每步两个虚拟视图 token 聚合后，使用官方双向 soft-pointer 选择执行前缀。
+保持原 checkpoint、确定性采样、7.5 Hz、相机标定和 XY 控制流程，Z、旋转与夹爪沿用原部署逻辑。
+
+```bash
+/home/huiyuan/miniconda3/envs/pushbox/bin/python /home/huiyuan/teleoperation/maze_real/scripts/deployment/cartesian.py "/home/huiyuan/teleoperation/maze_real/outputs/maze_planarp_train49_7p5hz/checkpoints/epoch_0209.pt" \
+  --weights model --device cuda:0 \
+  --calibration "/home/huiyuan/teleoperation/threading_real/calibration/block_grasp_spatial.json" \
+  --autohorizon --autohorizon-method bidirectional \
+  --autohorizon-hold-thr 0.3 --autohorizon-entropy-q 0.9 --autohorizon-run-len 1 \
+  --policy-hz 7.5 --execute-steps 10 --sync-timeout 3.0 \
+  --episodes 20 --max-cycles 0 \
+  --initial-grasp-width 0.02 \
+  --trace-output "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze10_autohorizon_bidir.jsonl" \
+  --results-csv "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/maze10_autohorizon_bidir.csv" \
+  --execute --confirm-real-robot
+```
+
+`--autohorizon` 与 `--aac`、`--selector` 互斥；`--execute-steps 10` 不覆盖所选长度。
+CSV condition 为 `autohorizon`，trace 保存原始/执行长度与指针诊断。
+`generated_action_tokens=20` 表示 10 步 × 2 个视图 token，`generated_action_steps=10` 为动作步数。
 
 ## Threading：每个条件 20 次
 
@@ -201,61 +261,59 @@ trace 中记录 `xi`、`h_entropy`、`action_magnitude`、
 `magnitude_threshold_reached`、候选方差、生成步数及推理耗时，可核查这一行为。
 `generated_action_tokens` 沿用 AAC 命名，表示 `N*H` 个动作时间步，不是 ARP 内部空间 token 数。
 
+## Threading 单相机 PlanARP：AutoHorizon（20 次）
+
+使用与上方固定长度、learned selector 和 AAC 主实验相同的单相机 epoch 8 checkpoint
+（`val_loss=10.981`）：`horizon=20`、`action_chunk_size=20`、`plan_steps=4`、
+`pointcloud_views=[sideview]`、不预测夹爪。
+每次在同一个 chunk 内完整生成 20 步，AutoHorizon 根据动作 attention 选择执行 1–20 步。
+6 个空间 token 聚合为一个动作步，长度算法沿用官方实现。
+相机选择由 checkpoint 决定，只启用 `sideview` 对应的物理相机。
+
+保持主实验的 `model` 权重、7.5 Hz 控制频率、相机标定、动作限制和起始条件。
+日志单独命名为 `threading20_autohorizon_bidir.*`；旧 H10 实验日志保留，分别统计。
+
+```bash
+/home/huiyuan/miniconda3/envs/pushbox/bin/python /home/huiyuan/teleoperation/threading_real/scripts/deployment/cartesian.py "/home/huiyuan/teleoperation/training_runs/planarp_chunks_20260914_165545/threading_planarp_chunk20/checkpoints/epoch=0008-val_loss=10.981.ckpt" \
+  --weights model --device cuda:0 \
+  --pointcloud-calibration "/home/huiyuan/teleoperation/threading_real/calibration/block_grasp_spatial.json" \
+  --autohorizon --autohorizon-method bidirectional \
+  --autohorizon-hold-thr 0.3 --autohorizon-entropy-q 0.9 --autohorizon-run-len 1 \
+  --policy-hz 7.5 --execute-steps 20 \
+  --prediction-mode full_then_truncate --synchronous --sync-timeout 5.0 \
+  --episodes 20 --max-cycles 0 \
+  --grasp-before-inference --initial-grasp-width 0.02 \
+  --trace-output "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/threading20_autohorizon_bidir.jsonl" \
+  --results-csv "/home/huiyuan/teleoperation/data/analysis/selector_eval_matched_20260916/logs/threading20_autohorizon_bidir.csv" \
+  --execute --confirm-real-robot
+```
+
+启用后，执行步数由 AutoHorizon 决定，`--execute-steps 20` 不会覆盖或额外截断所选长度。
+不能同时使用 `--aac`、`--chunk-selector`、`--execution-schedule` 或 `required_only`。
+每次一次视觉编码、一次完整预测，沿用确定性 MVT 推理，并保留部署对完整预测的检查。
+
+CSV 的 condition 为 `autohorizon`。JSONL 记录 `raw_horizon`、`h_star`、
+`selected_steps`、`executed_steps`、前后向指针及 attention 聚合方式。
+此处 `generated_action_tokens=120` 是 20 步 × 6 个空间 token；
+`generated_action_steps=20` 才是动作时间步数，与上方 AAC 的同名 token 统计口径不同。
+
+本 H20 checkpoint 的阶段性实机结果见文首总表及下方 AutoHorizon 执行长度分布。
+算法与接口说明见 [AutoHorizon README](../threading_real/autohorizon/README.md)。
+
 ## AAC 评估结果（2026-09-18）
 
 以下按两份 CSV 当前保存的记录统计；成功标签为运行结束后的人工填写结果。Maze 为 20 条记录，Threading 为 11 条记录，后者尚未达到计划的 20 次。不同 alpha 不合并。
 
-| 任务 / 条件 | 计划次数 | 计入次数 | 中断失败数 | 成功数 | 失败数（含中断） | 成功率 | 成功平均耗时 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Maze H10 AAC（alpha=0.04，N=20） | 20 | 20 | 0 | 12 | 8 | 60.00% | 33.98 s |
-| Threading H20 AAC（alpha=1，N=20） | 20 | 11 | 1 | 3 | 8 | 30% | 22.21 s |
-
-统计口径与下文一致：有效 `completed` 加 `interrupted` 作分母，中断计失败；成功平均耗时仅取 `completed` 且 `success=1`。Threading episode 5 的原始 success 为空，统计时计失败，不修改 CSV；仅看已完成记录为 3/10（30.00%），不是本表主口径。Maze 编号缺少 17、19，但文件实际有 20 条记录，缺号不补成失败。CSV 不记录 alpha，参数由对应 JSONL 内部字段核对。
+成功率与成功平均耗时已并入文首总表。Threading episode 5 的 `interrupted` 记录计失败，不修改原 CSV；仅看 completed 为 3/10（30.00%），计入中断后为 3/11（27.27%）。Maze 编号缺少 17、19，但实际有 20 条记录，缺号不补成失败。CSV 不记录 alpha，参数由对应 JSONL 核对。
 
 ### Maze AAC 原始结果
 
 来源：[maze10_aac_alpha0p04_n20.csv](../data/analysis/selector_eval_matched_20260916/logs/maze10_aac_alpha0p04_n20.csv)。保留原编号及六位小数耗时，截止 episode 22，开始时间 `2026-09-18T12:28:55.003286+00:00`。
 
-| 原始 episode | 耗时（s） | 原始 success | status |
-| ---: | ---: | --- | --- |
-| 1 | 43.776891 | 1 | completed |
-| 2 | 5.521730 | 0 | completed |
-| 3 | 40.765360 | 1 | completed |
-| 4 | 39.774481 | 1 | completed |
-| 5 | 33.772384 | 1 | completed |
-| 6 | 32.272268 | 1 | completed |
-| 7 | 7.216247 | 0 | completed |
-| 8 | 4.539695 | 0 | completed |
-| 9 | 6.999378 | 0 | completed |
-| 10 | 6.544708 | 0 | completed |
-| 11 | 28.135390 | 1 | completed |
-| 12 | 10.701615 | 0 | completed |
-| 13 | 9.721139 | 1 | completed |
-| 14 | 29.928839 | 1 | completed |
-| 15 | 6.827067 | 0 | completed |
-| 16 | 29.214910 | 0 | completed |
-| 18 | 33.919387 | 1 | completed |
-| 20 | 43.655307 | 1 | completed |
-| 21 | 33.841563 | 1 | completed |
-| 22 | 38.156292 | 1 | completed |
-
 ### Threading AAC 原始结果
 
 来源：[threading20_aac_1_n20.csv](../data/analysis/selector_eval_matched_20260916/logs/threading20_aac_1_n20.csv)。截止 episode 11，开始时间 `2026-09-18T13:35:41.176359+00:00`。
 
-| 原始 episode | 耗时（s） | 原始 success | status |
-| ---: | ---: | --- | --- |
-| 1 | 30.622337 | 0 | completed |
-| 2 | 20.079235 | 0 | completed |
-| 3 | 21.694208 | 1 | completed |
-| 4 | 21.005494 | 0 | completed |
-| 5 | 2.149276 | 空值 | interrupted |
-| 6 | 22.173833 | 0 | completed |
-| 7 | 21.821717 | 1 | completed |
-| 8 | 30.438776 | 0 | completed |
-| 9 | 23.105389 | 1 | completed |
-| 10 | 7.090734 | 0 | completed |
-| 11 | 21.641451 | 0 | completed |
 
 ### 对应 trace 的执行长度快照
 
@@ -268,13 +326,47 @@ Maze [JSONL](../data/analysis/selector_eval_matched_20260916/logs/maze10_aac_alp
 
 本节仅登记实测数据。参数选择、动作表现及方法局限见 [AAC 分析](AAC_entropy_chunk_analysis.md)。历史基线不具有 CSV 层面的配对起始条件标识，不能把组间差异解释为 AAC 的因果效果。
 
+## AutoHorizon 执行长度分布（2026-09-22）
+
+### Maze H10
+
+来源：[Maze H10 CSV](../data/analysis/selector_eval_matched_20260916/logs/maze10_autohorizon_bidir.csv) 与 [JSONL](../data/analysis/selector_eval_matched_20260916/logs/maze10_autohorizon_bidir.jsonl)，trace 截止时间戳 `1790075790.351718`。
+`chunk=horizon=10`，trace 方法为 `bidir_soft_pointer`。按 `cycle=1` 分段，共 20 段 trace、195 次决策，全部 `executed=true`；`raw_horizon`、`h_star`、`execution_steps` 与 `executed_steps` 全部一致。
+
+| 实际执行长度 | 决策次数 | 占比 |
+| --- | ---: | ---: |
+| 4 步 | 35 | 17.95% |
+| 5 步 | 10 | 5.13% |
+| 10 步 | 150 | 76.92% |
+| 1–3、6–9 步 | 0 | 0.00% |
+
+按决策次数加权，平均执行 **8.67 步**，中位数 **10 步**；完整 H10 占 76.92%，短于完整 horizon 的 45 次决策占 23.08%。每次仍完整生成 10 步，再按所选长度执行。
+
+编号核对：JSONL 前 19 段为 episode 1–19，最后一段从 `cycle=1`、`episode=1` 重新开始；其首条时间为 `2026-09-22T11:16:15.200440+00:00`，落在 CSV episode 21 的执行时段内，因此单独计为第 20 段，不与首段 episode 1 合并。成功率和成功平均耗时按 CSV 统计，chunk 分布按已执行决策统计。
+
+### Threading H20
+
+来源：[Threading H20 JSONL](../data/analysis/selector_eval_matched_20260916/logs/threading20_autohorizon_bidir.jsonl)，截止时间戳 `1790069959.7247248`。
+`chunk=horizon=20`，双向模式，`hold_thr=0.3`、`max_entropy_q=0.9`、`run_len=1`。
+9 个 episode（2–10）共 36 次决策，全部已执行；`raw_horizon`、`h_star` 和 `executed_steps` 一致。
+
+| 实际执行长度 | 决策次数 | 占比 |
+| --- | ---: | ---: |
+| 20 步 | 36 | 100% |
+| 1–19 步 | 0 | 0% |
+
+前向长度全部为 10，反向量为 11（33 次）或 10（3 次），`join_row` 全部为 0；每次均满足官方双向规则的 `N_forward + N_backward >= 20` 与拼接条件，因此返回完整 20 步。本批执行长度与固定 H20 相同，未出现动态长度变化。
+
+过滤核查：没有额外按权重删值、筛选层/头或强制补足长度。官方熵筛选每次只排除前向前两行，保留 18/20 行；去掉前向熵筛选重算，前向长度仍全部为 10。6 个空间 token 的动作步聚合及层头平均会合并局部差异，但现有证据不支持“过度过滤导致固定 20 步”。均匀 attention 也可触发同一完整长度规则，因此不将满长输出解释为模型确信整段动作均可靠。
+
+旧 Threading H10 的实验不并入本 H20 分布。
+
 ## 评估与记录
 
 每轮从开始推理计时，统一给 60 秒完成任务；达到成功条件、明显失败或超时后按 Enter 结束。
-60 秒需人工计时，当前命令不自动执行时限判断；`--max-cycles 0` 表示不限制推理轮数。
 不使用相同的最大推理轮数作时限，因为不同方法的执行长度及推理开销不同。
 
-成功条件在第一轮前固定，三组一致：Maze 完成迷宫路径并到达预先指定的目标位置；Threading
+成功条件在第一轮前固定，各组一致：Maze 完成迷宫路径并到达预先指定的目标位置；Threading
 完成预先约定的穿线终态。开始后的人工辅助、卡住、物体脱落、超时或动作检查中止记为失败，
 并记录原因。不能把 selector 判为精细区当作任务成功，也不能把模型的验证准确率当成功率。
 
@@ -291,7 +383,7 @@ Maze 填写结果后才进入 guide 确认。每次保存后显示已评估次�
 平均耗时仅统计 `completed` 且 `success=1` 的尝试。部署终端现有统计仍使用旧口径，可能与本报告不同。
 没有成功样本时显示“暂无成功样本”，不记为 0 秒。CSV 保留每次尝试的原始耗时，失败耗时不参与平均值。
 
-六条命令的 `--results-csv` 分别指定六个 CSV 文件名。同名文件会读取历史记录并继续写入，
+各部署命令的 `--results-csv` 分别指定独立 CSV 文件名。同名文件会读取历史记录并继续写入，
 CSV 编号从已有最大编号加 1 开始，统计包含历史完整记录。补跑时沿用同一名字，
 `--episodes` 指定本次新增尝试数（例如已有 8 次，再运行 `--episodes 12`）。
 文件中的任务、selector 条件和真机/诊断模式必须与当前命令一致。
@@ -316,123 +408,26 @@ CSV 列为 `episode, task, condition, executed, started_at, duration_s, success,
 
 来源：[CSV](../data/analysis/selector_eval_20260914_142324/logs/maze_no_selector.csv)。
 
-| CSV episode | 统计结果（1 / 0） | 耗时（秒） | 状态 / 计入口径 |
-| --- | --- | --- | --- |
-| 1 | 1 | 11.694 | completed |
-| 2 | 0 | 9.955 | completed |
-| 3 | 1 | 9.818 | completed |
-| 4 | 1 | 9.670 | completed |
-| 5 | 1 | 13.160 | completed |
-| 6 | 1 | 10.676 | completed |
-| 7 | 0 | 4.967 | completed |
-| 8 | 0 | 5.359 | interrupted，计失败 |
-| 9 | 1 | 11.437 | completed |
-| 10 | 0 | 3.984 | completed |
-| 11 | 1 | 9.780 | completed |
-| 12 | 1 | 13.568 | completed |
-| 13 | 0 | 5.311 | interrupted，计失败 |
-| 14 | 1 | 14.040 | completed |
-| 15 | 1 | 9.786 | completed |
-| 16 | 1 | 12.584 | completed |
-| 17 | 1 | 12.877 | completed |
-| 18 | 1 | 12.685 | completed |
-| 19 | 0 | 4.414 | completed |
-| 20 | 0 | 4.561 | completed |
+
 
 ### Maze H10 有 selector（动态 4–10 步）
 
-来源：[CSV](../data/analysis/selector_eval_20260914_142324/logs/maze10_selector_h4.csv)。
 
-| CSV episode | 统计结果（1 / 0） | 耗时（秒） | 状态 / 计入口径 |
-| --- | --- | --- | --- |
-| 1 | 1 | 16.073 | completed |
-| 2 | 0 | 10.026 | completed |
-| 3 | 1 | 17.286 | completed |
-| 4 | 1 | 17.359 | completed |
-| 5 | 1 | 11.870 | completed |
-| 6 | 1 | 16.164 | completed |
-| 7 | 1 | 14.395 | completed |
-| 8 | 0 | 14.810 | completed |
-| 9 | 1 | 20.629 | completed |
-| 10 | 0 | 9.229 | completed |
-| 11 | 0 | 17.452 | completed |
-| 12 | 1 | 25.228 | completed |
-| 13 | 1 | 14.749 | completed |
-| 14 | 0 | 11.129 | completed |
-| 15 | 1 | 13.296 | completed |
-| 16 | 1 | 12.780 | completed |
-| 17 | 1 | 16.737 | completed |
-| 18 | 1 | 57.502 | completed |
-| 19 | 1 | 13.587 | completed |
-| 20 | 1 | 14.549 | completed |
 
 ### Threading H20 无 selector（固定 20 步）
 
 来源：[CSV](../data/analysis/selector_eval_chunks_20260916/logs/threading20_no_selector.csv)。
 
-| CSV episode | 统计结果（1 / 0） | 耗时（秒） | 状态 / 计入口径 |
-| --- | --- | --- | --- |
-| 1 | 0 | 15.284 | completed |
-| 2 | 1 | 14.379 | completed |
-| 3 | 1 | 12.853 | completed |
-| 4 | 0 | 15.703 | completed |
-| 5 | 1 | 12.787 | completed |
-| 6 | 1 | 14.820 | completed |
-| 7 | 0 | 16.125 | completed |
-| 8 | 0 | 13.781 | completed |
-| 9 | 1 | 14.469 | completed |
-| 10 | 0 | 16.531 | completed |
-| 11 | 1 | 14.473 | completed |
-| 12 | 0 | 14.023 | completed |
-| 13 | 0 | 11.530 | completed |
-| 14 | 0 | 10.483 | completed |
-| 15 | 0 | 17.747 | completed |
-| 16 | 1 | 17.733 | completed |
-| 17 | 0 | 19.983 | completed |
-| 19 | 1 | 15.390 | completed |
-| 20 | 0 | 14.770 | completed |
-| 21 | 1 | 17.712 | completed |
+
 
 ### Threading H20 新 selector（动态 8–20 步）
 
 来源：[CSV](../data/analysis/selector_eval_matched_20260916/logs/threading20_selector_h8_progress.csv)。
 
-| CSV episode | 统计结果（1 / 0） | 耗时（秒） | 状态 / 计入口径 |
-| --- | --- | --- | --- |
-| 1 | 1 | 20.015 | completed |
-| 2 | 0 | 20.109 | completed |
-| 3 | 1 | 20.252 | completed |
-| 4 | 1 | 16.007 | completed |
-| 5 | 0 | 13.251 | completed |
-| 6 | 1 | 12.300 | completed |
-| 7 | 0 | 13.834 | completed |
-| 8 | 1 | 19.768 | completed |
-| 9 | 0 | 15.692 | completed |
-| 10 | 1 | 18.804 | completed |
-| 11 | 0 | 19.159 | completed |
-| 12 | 0 | 15.313 | completed |
-| 13 | 0 | 17.895 | completed |
-| 14 | 1 | 19.329 | completed |
-| 15 | 1 | 17.799 | completed |
-| 16 | 1 | 16.119 | completed |
-| 17 | 1 | 14.924 | completed |
-| 18 | 1 | 17.150 | completed |
-| 19 | 1 | 17.131 | completed |
-| 20 | 1 | 19.239 | completed |
 
-## 成功率与耗时汇总（2026-09-16 更新）
+## 历史基线统计说明
 
-- 成功率分母：`completed` 且 `success` 为 0/1 的记录，加未被明确排除的 `interrupted` 记录。
-- 成功率分子：`completed` 且 `success=1` 的记录数。`interrupted` 计失败（下文明确排除的记录除外）。
-- 成功平均耗时：仅统计上述成功记录；失败和中断不进入耗时均值。
-- `running`、`pending_result`、未填写结果的其他状态暂不计入。
-
-| 任务 / 条件 | 计入次数 | 中断失败数 | 成功数 | 失败数（含中断） | 成功率 | 成功平均耗时 |
-| --- | --- | --- | --- | --- | --- | --- |
-| Maze H10 无 selector（固定 10 步） | 20 | 2 | 13 | 7 | 65.00% | 11.68 s |
-| Maze H10 有 selector（动态 4–10 步） | 20 | 0 | 15 | 5 | 75.00% | 18.81 s |
-| Threading H20 无 selector（固定 20 步） | 20 | 0 | 9 | 11 | 45.00% | 14.96 s |
-| Threading H20 新 selector（动态 8–20 步） | 20 | 0 | 13 | 7 | 65.00% | 17.60 s |
+成功率与成功平均耗时已并入文首总表。`running`、`pending_result` 和其他未填写结果的记录暂不计入。
 
 Maze 无 selector 的 episode 8、13 计失败，因此为 **13/20（65%）**，不再是 13/18。
 Threading 无 selector 按用户指定排除 episode 18，仅统计其余 20 条记录，结果为 **9/20（45%）**。
